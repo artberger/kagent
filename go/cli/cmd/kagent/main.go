@@ -375,11 +375,13 @@ Examples:
   kagent run .`,
 		Args: cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
+			// Priority: positional argument > flag > default
 			if len(args) > 0 {
 				runCfg.ProjectDir = args[0]
-			} else {
+			} else if runCfg.ProjectDir == "" {
 				runCfg.ProjectDir = "."
 			}
+			// If --project-dir flag was set, it's already in runCfg.ProjectDir
 
 			if err := cli.RunCmd(cmd.Context(), runCfg); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
