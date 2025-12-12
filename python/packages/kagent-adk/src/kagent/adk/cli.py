@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import uvicorn
 from a2a.types import AgentCard
 from google.adk.cli.utils.agent_loader import AgentLoader
 
-from kagent.core import KAgentConfig, configure_tracing
+from kagent.core import KAgentConfig, configure_logging, configure_tracing
 
 from . import AgentConfig, KAgentApp
 from .skill_fetcher import fetch_skill
@@ -93,7 +94,16 @@ def run(
         agent_card = json.load(f)
     agent_card = AgentCard.model_validate(agent_card)
 
-    kagent_app = KAgentApp(root_agent, agent_card, app_cfg.url, app_cfg.app_name)
+    # Attempt to import optional user-defined lifespan(app) from the agent package
+    lifespan = None
+    try:
+        module_candidate = importlib.import_module(name)
+        if hasattr(module_candidate, "lifespan"):
+            lifespan = module_candidate.lifespan
+    except Exception:
+        logger.exception(f"Failed to load agent module '{name}' for lifespan")
+
+    kagent_app = KAgentApp(root_agent, agent_card, app_cfg.url, app_cfg.app_name, lifespan=lifespan)
 
     if local:
         logger.info("Running in local mode with InMemorySessionService")
@@ -132,16 +142,6 @@ def test(
     agent_card = AgentCard.model_validate(agent_card)
     agent_config = AgentConfig.model_validate(config)
     asyncio.run(test_agent(agent_config, agent_card, task))
-
-
-# --- Configure Logging ---
-def configure_logging() -> None:
-    """Configure logging based on LOG_LEVEL environment variable."""
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=log_level,
-    )
-    logging.info(f"Logging configured with level: {log_level}")
 
 
 def run_cli():
