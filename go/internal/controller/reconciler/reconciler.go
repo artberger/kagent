@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/hashicorp/go-multierror"
 	reconcilerutils "github.com/kagent-dev/kagent/go/internal/controller/reconciler/utils"
@@ -27,9 +27,7 @@ import (
 	"github.com/kagent-dev/kagent/go/internal/database"
 	"github.com/kagent-dev/kagent/go/internal/utils"
 	"github.com/kagent-dev/kagent/go/internal/version"
-	mcp_client "github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -57,9 +55,6 @@ type kagentReconciler struct {
 	dbClient database.Client
 
 	defaultModelConfig types.NamespacedName
-
-	// TODO: Remove this lock since we have a DB which we can batch anyway
-	upsertLock sync.Mutex
 }
 
 func NewKagentReconciler(
@@ -96,7 +91,8 @@ func (a *kagentReconciler) ReconcileKagentAgent(ctx context.Context, req ctrl.Re
 }
 
 func (a *kagentReconciler) handleAgentDeletion(req ctrl.Request) error {
-	if err := a.dbClient.DeleteAgent(req.String()); err != nil {
+	id := utils.ConvertToPythonIdentifier(req.String())
+	if err := a.dbClient.DeleteAgent(id); err != nil {
 		return fmt.Errorf("failed to delete agent %s: %w",
 			req.String(), err)
 	}
@@ -620,10 +616,6 @@ func (a *kagentReconciler) deleteObjects(ctx context.Context, objects map[types.
 }
 
 func (a *kagentReconciler) upsertAgent(ctx context.Context, agent *v1alpha2.Agent, agentOutputs *agent_translator.AgentOutputs) error {
-	// lock to prevent races
-	a.upsertLock.Lock()
-	defer a.upsertLock.Unlock()
-
 	id := utils.ConvertToPythonIdentifier(utils.GetObjectRef(agent))
 	dbAgent := &database.Agent{
 		ID:     id,
@@ -639,14 +631,12 @@ func (a *kagentReconciler) upsertAgent(ctx context.Context, agent *v1alpha2.Agen
 }
 
 func (a *kagentReconciler) upsertToolServerForRemoteMCPServer(ctx context.Context, toolServer *database.ToolServer, remoteMcpServer *v1alpha2.RemoteMCPServerSpec, namespace string) ([]*v1alpha2.MCPTool, error) {
-	// lock to prevent races
-	a.upsertLock.Lock()
-	defer a.upsertLock.Unlock()
-
+	// Store tool server - database handles concurrency via atomic upsert
 	if _, err := a.dbClient.StoreToolServer(toolServer); err != nil {
 		return nil, fmt.Errorf("failed to store toolServer %s: %v", toolServer.Name, err)
 	}
 
+	// Create transport and list tools from remote MCP server
 	tsp, err := a.createMcpTransport(ctx, remoteMcpServer, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client for toolServer %s: %v", toolServer.Name, err)
@@ -657,6 +647,7 @@ func (a *kagentReconciler) upsertToolServerForRemoteMCPServer(ctx context.Contex
 		return nil, fmt.Errorf("failed to fetch tools for toolServer %s: %v", toolServer.Name, err)
 	}
 
+	// Refresh tools in database - uses transaction for atomicity
 	if err := a.dbClient.RefreshToolsForServer(toolServer.Name, toolServer.GroupKind, tools...); err != nil {
 		return nil, fmt.Errorf("failed to refresh tools for toolServer %s: %v", toolServer.Name, err)
 	}
@@ -664,41 +655,73 @@ func (a *kagentReconciler) upsertToolServerForRemoteMCPServer(ctx context.Contex
 	return tools, nil
 }
 
-func (a *kagentReconciler) createMcpTransport(ctx context.Context, s *v1alpha2.RemoteMCPServerSpec, namespace string) (transport.Interface, error) {
+func (a *kagentReconciler) createMcpTransport(ctx context.Context, s *v1alpha2.RemoteMCPServerSpec, namespace string) (mcp.Transport, error) {
 	headers, err := s.ResolveHeaders(ctx, a.kube, namespace)
 	if err != nil {
 		return nil, err
 	}
 
+	httpClient := newHTTPClient(headers)
+
 	switch s.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
-		return transport.NewSSE(s.URL, transport.WithHeaders(headers))
+		return &mcp.SSEClientTransport{
+			Endpoint:   s.URL,
+			HTTPClient: httpClient,
+		}, nil
 	default:
-		return transport.NewStreamableHTTP(s.URL, transport.WithHTTPHeaders(headers))
+		return &mcp.StreamableClientTransport{
+			Endpoint:   s.URL,
+			HTTPClient: httpClient,
+		}, nil
 	}
 }
 
-func (a *kagentReconciler) listTools(ctx context.Context, tsp transport.Interface, toolServer *database.ToolServer) ([]*v1alpha2.MCPTool, error) {
-	client := mcp_client.NewClient(tsp)
-	err := client.Start(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start client for toolServer %s: %v", toolServer.Name, err)
+// go-sdk does not have a WithHeaders option when initializing transport
+// so we need to create a custom HTTP client that adds headers to all requests.
+func newHTTPClient(headers map[string]string) *http.Client {
+	if len(headers) == 0 {
+		return http.DefaultClient
 	}
-	defer client.Close()
-	_, err = client.Initialize(ctx, mcp.InitializeRequest{
-		Params: mcp.InitializeParams{
-			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			Capabilities:    mcp.ClientCapabilities{},
-			ClientInfo: mcp.Implementation{
-				Name:    "kagent-controller",
-				Version: version.Version,
-			},
+	return &http.Client{
+		Transport: &headerTransport{
+			headers: headers,
+			base:    http.DefaultTransport,
 		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize client for toolServer %s: %v", toolServer.Name, err)
 	}
-	result, err := client.ListTools(ctx, mcp.ListToolsRequest{})
+}
+
+// headerTransport is an http.RoundTripper that adds custom headers to requests.
+type headerTransport struct {
+	headers map[string]string
+	base    http.RoundTripper
+}
+
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	if t.base == nil {
+		t.base = http.DefaultTransport
+	}
+	return t.base.RoundTrip(req)
+}
+
+func (a *kagentReconciler) listTools(ctx context.Context, tsp mcp.Transport, toolServer *database.ToolServer) ([]*v1alpha2.MCPTool, error) {
+	impl := &mcp.Implementation{
+		Name:    "kagent-controller",
+		Version: version.Version,
+	}
+	client := mcp.NewClient(impl, nil)
+
+	session, err := client.Connect(ctx, tsp, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect client for toolServer %s: %v", toolServer.Name, err)
+	}
+	defer session.Close()
+
+	result, err := session.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tools for toolServer %s: %v", toolServer.Name, err)
 	}

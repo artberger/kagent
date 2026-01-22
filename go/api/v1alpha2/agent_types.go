@@ -86,9 +86,9 @@ type DeclarativeAgentSpec struct {
 	// +optional
 	ModelConfig string `json:"modelConfig,omitempty"`
 	// Whether to stream the response from the model.
-	// If not specified, the default value is true.
+	// If not specified, the default value is false.
 	// +optional
-	Stream *bool `json:"stream,omitempty"`
+	Stream bool `json:"stream,omitempty"`
 	// +kubebuilder:validation:MaxItems=20
 	Tools []*Tool `json:"tools,omitempty"`
 	// A2AConfig instantiates an A2A server for this agent,
@@ -107,6 +107,7 @@ type DeclarativeAgentSpec struct {
 	// If true, the agent will automatically execute python code blocks in the LLM responses.
 	// Code will be executed in a sandboxed environment.
 	// +optional
+	// due to a bug in adk (https://github.com/google/adk-python/issues/3921), this field is ignored for now.
 	ExecuteCodeBlocks *bool `json:"executeCodeBlocks,omitempty"`
 }
 

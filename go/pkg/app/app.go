@@ -38,6 +38,7 @@ import (
 
 	"github.com/kagent-dev/kagent/go/internal/a2a"
 	"github.com/kagent-dev/kagent/go/internal/database"
+	"github.com/kagent-dev/kagent/go/internal/mcp"
 	versionmetrics "github.com/kagent-dev/kagent/go/internal/metrics"
 
 	"github.com/kagent-dev/kagent/go/internal/controller/reconciler"
@@ -109,6 +110,9 @@ type Config struct {
 		InitialBufSize resource.QuantityValue `default:"4Ki"`
 		Timeout        time.Duration          `default:"60s"`
 	}
+	Proxy struct {
+		URL string
+	}
 	LeaderElection     bool
 	ProbeAddr          string
 	SecureMetrics      bool
@@ -157,6 +161,8 @@ func (cfg *Config) SetFlags(commandLine *flag.FlagSet) {
 	commandLine.Var(&cfg.Streaming.MaxBufSize, "streaming-max-buf-size", "The maximum size of the streaming buffer.")
 	commandLine.Var(&cfg.Streaming.InitialBufSize, "streaming-initial-buf-size", "The initial size of the streaming buffer.")
 	commandLine.DurationVar(&cfg.Streaming.Timeout, "streaming-timeout", 60*time.Second, "The timeout for the streaming connection.")
+
+	commandLine.StringVar(&cfg.Proxy.URL, "proxy-url", "", "Proxy URL for internally-built k8s URLs (e.g., http://proxy.kagent.svc.cluster.local:8080)")
 
 	commandLine.StringVar(&agent_translator.DefaultImageConfig.Registry, "image-registry", agent_translator.DefaultImageConfig.Registry, "The registry to use for the image.")
 	commandLine.StringVar(&agent_translator.DefaultImageConfig.Tag, "image-tag", agent_translator.DefaultImageConfig.Tag, "The tag to use for the image.")
@@ -372,6 +378,7 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		mgr.GetClient(),
 		cfg.DefaultModelConfig,
 		extensionCfg.AgentPlugins,
+		cfg.Proxy.URL,
 	)
 
 	rcnclr := reconciler.NewKagentReconciler(
@@ -444,6 +451,17 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		os.Exit(1)
 	}
 
+	// Create MCP handler that bridges to A2A
+	mcpHandler, err := mcp.NewMCPHandler(
+		mgr.GetClient(),
+		cfg.A2ABaseUrl+httpserver.APIPathA2A,
+		extensionCfg.Authenticator,
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create MCP handler")
+		os.Exit(1)
+	}
+
 	// +kubebuilder:scaffold:builder
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
@@ -480,10 +498,12 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		BindAddr:          cfg.HttpServerAddr,
 		KubeClient:        mgr.GetClient(),
 		A2AHandler:        a2aHandler,
+		MCPHandler:        mcpHandler,
 		WatchedNamespaces: watchNamespacesList,
 		DbClient:          dbClient,
 		Authorizer:        extensionCfg.Authorizer,
 		Authenticator:     extensionCfg.Authenticator,
+		ProxyURL:          cfg.Proxy.URL,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create HTTP server")
