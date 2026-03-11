@@ -7,7 +7,6 @@
 tag: ""
 registry: "cr.kagent.dev"
 
-
 imagePullSecrets: []
 imagePullPolicy: IfNotPresent
 
@@ -53,9 +52,14 @@ nodeSelector: {}
 database:
   type: sqlite
   sqlite:
+    vectorEnabled: true
     databaseName: kagent.db
   postgres:
+    vectorEnabled: true
     url: postgres://postgres:kagent@pgsql-postgresql.kagent.svc.cluster.local:5432/postgres
+    # Path to a file containing the database URL.
+    # Takes precedence over url when set.
+    urlFile: ""
 
 # ==============================================================================
 # CONTROLLER CONFIGURATION
@@ -64,12 +68,28 @@ database:
 controller:
   replicas: 1
   loglevel: "info"
+  # -- Global deployment defaults applied to all agent pods.
+  # Per-agent settings in the Agent CRD take precedence over these defaults.
+  agentDeployment:
+    # -- Default ServiceAccount name for agent pods.
+    # When set, agent pods that don't specify an explicit serviceAccountName
+    # will use this ServiceAccount instead of creating a per-agent one.
+    # Useful for Workload Identity (GCP, AWS IRSA, Azure Workload Identity).
+    # Precedence: agent-level serviceAccountName > this default > auto-created SA.
+    # @default -- "" (auto-create per-agent ServiceAccount)
+    serviceAccountName: ""
   # -- The base URL of the A2A Server endpoint, as advertised to clients.
   # @default -- `http://<fullname>-controller.<namespace>.svc.cluster.local:<port>`
   a2aBaseUrl: ""
   agentImage:
     registry: ""
     repository: kagent-dev/kagent/app
+    tag: "" # Will default to global, then Chart version
+    pullPolicy: ""
+  # -- The image used by the skills-init container to clone skills from Git and pull OCI skill images.
+  skillsInitImage:
+    registry: ""
+    repository: kagent-dev/kagent/skills-init
     tag: "" # Will default to global, then Chart version
     pullPolicy: ""
   streaming: # Streaming buffer size for A2A communication
@@ -171,6 +191,9 @@ providers:
     model: "llama3.2"
     config:
       host: host.docker.internal:11434
+      options:
+        num_ctx: "64000"
+
   anthropic:
     provider: Anthropic
     model: "claude-3-5-haiku-20241022"
@@ -204,17 +227,14 @@ kmcp:
   nameOverride: "kmcp"
   fullnameOverride: "" # Override if desired
   namespaceOverride: "" # Override if desired (in conjunction with fullnameOverride to drop the `kagent-` prefix if you want)
-  image:
-    tag: "0.2.2" # Required until https://github.com/kagent-dev/kmcp/issues/74 is resolved
-  # See https://github.com/kagent-dev/kmcp/blob/main/helm/kmcp/values.yaml for chart values
 
 # ==============================================================================
 # BUILT-IN TOOLS
 # ==============================================================================
 
 kagent-tools:
-  fullnameOverride: kagent-tools
   enabled: true
+  nameOverride: tools
   replicaCount: 1
   resources:
     requests:
@@ -225,6 +245,8 @@ kagent-tools:
       memory: 1Gi
   tools:
     loglevel: "debug"
+    metrics:
+      port: 8085  # Use a different port than the main service port (8084) to avoid duplicate port definitions
 
 # ==============================================================================
 # PROXY CONFIGURATION
@@ -349,7 +371,9 @@ tools:
 grafana-mcp:
   grafana:
     url: "grafana.kagent:3000/api"
-    apiKey: "-"
+    serviceAccountToken: ""
+    # apiKey: "" # Deprecated - use serviceAccountToken instead.
+    # secretRef: ""  # Name of Secret to reference (contains GRAFANA_SERVICE_ACCOUNT_TOKEN or GRAFANA_API_KEY)
   resources:
     requests:
       cpu: 100m
@@ -384,13 +408,14 @@ otel:
     enabled: false
     exporter:
       otlp:
-        endpoint: http://host.docker.internal:4317
+        endpoint: ""
+        protocol: "grpc"
         timeout: 15
         insecure: true
   logging:
     enabled: false
     exporter:
       otlp:
-        endpoint: http://host.docker.internal:4317
+        endpoint: ""
         timeout: 15
         insecure: true
