@@ -63,6 +63,20 @@ type BaseModel struct {
 	APIKeyPassthrough bool `json:"api_key_passthrough,omitempty"`
 }
 
+// GDCHTokenExchangeConfig holds the GDCH-specific token exchange fields
+// serialised into the agent config JSON consumed by the Python runtime.
+type GDCHTokenExchangeConfig struct {
+	ServiceAccountPath string `json:"service_account_path"`
+	Audience           string `json:"audience"`
+}
+
+// TokenExchangeConfig is the discriminated union serialised into the agent
+// config JSON. Type is always "GDCHServiceAccount" for now.
+type TokenExchangeConfig struct {
+	Type               string                   `json:"type"`
+	GDCHServiceAccount *GDCHTokenExchangeConfig `json:"gdch_service_account,omitempty"`
+}
+
 type OpenAI struct {
 	BaseModel
 	BaseUrl          string   `json:"base_url"`
@@ -75,6 +89,9 @@ type OpenAI struct {
 	Temperature      *float64 `json:"temperature,omitempty"`
 	Timeout          *int     `json:"timeout,omitempty"`
 	TopP             *float64 `json:"top_p,omitempty"`
+
+	// TokenExchange configures dynamic bearer token acquisition
+	TokenExchange *TokenExchangeConfig `json:"token_exchange,omitempty"`
 }
 
 const (
@@ -86,6 +103,7 @@ const (
 	ModelTypeOllama          = "ollama"
 	ModelTypeGemini          = "gemini"
 	ModelTypeBedrock         = "bedrock"
+	ModelTypeSAPAICore       = "sap_ai_core"
 )
 
 func (o *OpenAI) MarshalJSON() ([]byte, error) {
@@ -229,6 +247,10 @@ type Bedrock struct {
 	BaseModel
 	// Region is the AWS region where the model is available
 	Region string `json:"region,omitempty"`
+	// AdditionalModelRequestFields passes model-specific parameters to Bedrock's
+	// additionalModelRequestFields in the Converse API. Use this for provider-specific
+	// options outside the standard InferenceConfiguration block.
+	AdditionalModelRequestFields map[string]any `json:"additional_model_request_fields,omitempty"`
 }
 
 func (b *Bedrock) MarshalJSON() ([]byte, error) {
@@ -244,6 +266,28 @@ func (b *Bedrock) MarshalJSON() ([]byte, error) {
 
 func (b *Bedrock) GetType() string {
 	return ModelTypeBedrock
+}
+
+type SAPAICore struct {
+	BaseModel
+	BaseUrl       string `json:"base_url"`
+	ResourceGroup string `json:"resource_group,omitempty"`
+	AuthUrl       string `json:"auth_url,omitempty"`
+}
+
+func (s *SAPAICore) MarshalJSON() ([]byte, error) {
+	type Alias SAPAICore
+	return json.Marshal(&struct {
+		Type string `json:"type"`
+		*Alias
+	}{
+		Type:  ModelTypeSAPAICore,
+		Alias: (*Alias)(s),
+	})
+}
+
+func (s *SAPAICore) GetType() string {
+	return ModelTypeSAPAICore
 }
 
 // GenericModel is a catch-all model type used by the Go ADK when the model
@@ -308,6 +352,12 @@ func ParseModel(bytes []byte) (Model, error) {
 			return nil, err
 		}
 		return &bedrock, nil
+	case ModelTypeSAPAICore:
+		var sapAICore SAPAICore
+		if err := json.Unmarshal(bytes, &sapAICore); err != nil {
+			return nil, err
+		}
+		return &sapAICore, nil
 	}
 	return nil, fmt.Errorf("unknown model type: %s", model.Type)
 }
@@ -373,6 +423,9 @@ func ModelToEmbeddingConfig(m Model) *EmbeddingConfig {
 		e.Model = v.Model
 	case *Bedrock:
 		e.Model = v.Model
+	case *SAPAICore:
+		e.Model = v.Model
+		e.BaseUrl = v.BaseUrl
 	default:
 		e.Model = ""
 	}
@@ -383,6 +436,10 @@ func ModelToEmbeddingConfig(m Model) *EmbeddingConfig {
 type MemoryConfig struct {
 	TTLDays   int              `json:"ttl_days,omitempty"`
 	Embedding *EmbeddingConfig `json:"embedding,omitempty"`
+}
+
+type NetworkConfig struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
 }
 
 // AgentContextConfig is the context management configuration that flows through config.json to the Python runtime.
@@ -438,6 +495,7 @@ type AgentConfig struct {
 	ExecuteCode   *bool                 `json:"execute_code,omitempty"`
 	Stream        *bool                 `json:"stream,omitempty"`
 	Memory        *MemoryConfig         `json:"memory,omitempty"`
+	Network       *NetworkConfig        `json:"network,omitempty"`
 	ContextConfig *AgentContextConfig   `json:"context_config,omitempty"`
 }
 
@@ -468,6 +526,7 @@ func (a *AgentConfig) UnmarshalJSON(data []byte) error {
 		ExecuteCode   *bool                 `json:"execute_code,omitempty"`
 		Stream        *bool                 `json:"stream,omitempty"`
 		Memory        json.RawMessage       `json:"memory"`
+		Network       *NetworkConfig        `json:"network,omitempty"`
 		ContextConfig *AgentContextConfig   `json:"context_config,omitempty"`
 	}
 	if err := json.Unmarshal(data, &tmp); err != nil {
@@ -496,6 +555,7 @@ func (a *AgentConfig) UnmarshalJSON(data []byte) error {
 	a.ExecuteCode = tmp.ExecuteCode
 	a.Stream = tmp.Stream
 	a.Memory = memory
+	a.Network = tmp.Network
 	a.ContextConfig = tmp.ContextConfig
 	return nil
 }

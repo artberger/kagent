@@ -7,21 +7,23 @@ from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.llm_agent import ToolUnion
 from google.adk.agents.readonly_context import ReadonlyContext
-from google.adk.agents.remote_a2a_agent import AGENT_CARD_WELL_KNOWN_PATH, DEFAULT_TIMEOUT, RemoteA2aAgent
+from google.adk.agents.remote_a2a_agent import AGENT_CARD_WELL_KNOWN_PATH, DEFAULT_TIMEOUT
 from google.adk.models.anthropic_llm import Claude as ClaudeLLM
 from google.adk.models.google_llm import Gemini as GeminiLLM
-from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.mcp_tool import SseConnectionParams, StreamableHTTPConnectionParams
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
-from kagent.adk._approval import make_approval_callback
+from kagent.adk._approval import make_approval_callback, strip_confirmation_parts_callback
 from kagent.adk._mcp_toolset import KAgentMcpToolset
-from kagent.adk.models._litellm import KAgentLiteLlm
+from kagent.adk._remote_a2a_tool import KAgentRemoteA2AToolset
+from kagent.adk.models._anthropic import KAgentAnthropicLlm
+from kagent.adk.models._bedrock import KAgentBedrockLlm
+from kagent.adk.models._gemini import KAgentGeminiLlm
+from kagent.adk.models._ollama import create_ollama_llm
+from kagent.adk.models._openai import AzureOpenAI as OpenAIAzure
+from kagent.adk.models._openai import OpenAI as OpenAINative
 from kagent.adk.sandbox_code_executer import SandboxedLocalCodeExecutor
 from kagent.adk.tools.ask_user_tool import AskUserTool
-
-from .models import AzureOpenAI as OpenAIAzure
-from .models import OpenAI as OpenAINative
 
 logger = logging.getLogger(__name__)
 
@@ -166,12 +168,25 @@ class BaseLLM(BaseModel):
     headers: dict[str, str] | None = None
 
     # TLS/SSL configuration (applies to all model types)
-    tls_disable_verify: bool | None = None
+    tls_disable_verify: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tls_disable_verify", "tls_insecure_skip_verify"),
+    )
     tls_ca_cert_path: str | None = None
     tls_disable_system_cas: bool | None = None
 
     # API key passthrough: forward the Bearer token from incoming requests as the LLM API key
     api_key_passthrough: bool | None = None
+
+
+class GDCHTokenExchangeConfig(BaseModel):
+    service_account_path: str
+    audience: str
+
+
+class TokenExchangeConfig(BaseModel):
+    type: Literal["GDCHServiceAccount"]
+    gdch_service_account: GDCHTokenExchangeConfig | None = None
 
 
 class OpenAI(BaseLLM):
@@ -185,6 +200,9 @@ class OpenAI(BaseLLM):
     temperature: float | None = None
     timeout: int | None = None
     top_p: float | None = None
+
+    # Token exchange configuration
+    token_exchange: TokenExchangeConfig | None = None
 
     type: Literal["openai"]
 
@@ -218,10 +236,21 @@ class Gemini(BaseLLM):
 
 class Bedrock(BaseLLM):
     region: str | None = None
+    # additional_model_request_fields passes model-specific parameters to Bedrock's
+    # additionalModelRequestFields in the Converse API. Use this for provider-specific
+    # options outside the standard InferenceConfiguration block.
+    additional_model_request_fields: dict | None = None
     type: Literal["bedrock"]
 
 
-ModelUnion = Union[OpenAI, Anthropic, GeminiVertexAI, GeminiAnthropic, Ollama, AzureOpenAI, Gemini, Bedrock]
+class SAPAICore(BaseLLM):
+    base_url: str | None = None
+    resource_group: str = "default"
+    auth_url: str | None = None
+    type: Literal["sap_ai_core"]
+
+
+ModelUnion = Union[OpenAI, Anthropic, GeminiVertexAI, GeminiAnthropic, Ollama, AzureOpenAI, Gemini, Bedrock, SAPAICore]
 
 
 class ContextCompressionSettings(BaseModel):
@@ -252,6 +281,10 @@ class MemoryConfig(BaseModel):
     embedding: EmbeddingConfig | None = None  # Embedding model config for memory tools.
 
 
+class NetworkConfig(BaseModel):
+    allowed_domains: list[str] = Field(default_factory=list)
+
+
 class AgentConfig(BaseModel):
     model: ModelUnion = Field(discriminator="type")
     description: str
@@ -262,6 +295,7 @@ class AgentConfig(BaseModel):
     execute_code: bool | None = None
     stream: bool | None = None  # Refers to LLM response streaming, not A2A streaming
     memory: MemoryConfig | None = None  # Memory configuration
+    network: NetworkConfig | None = None
     context_config: ContextConfig | None = None
 
     def to_agent(self, name: str, sts_integration: Optional[ADKTokenPropagationPlugin] = None) -> Agent:
@@ -366,14 +400,14 @@ class AgentConfig(BaseModel):
                         timeout=timeout,
                     )
 
-                remote_a2a_agent = RemoteA2aAgent(
-                    name=remote_agent.name,
-                    agent_card=f"{remote_agent.url}{AGENT_CARD_WELL_KNOWN_PATH}",
-                    description=remote_agent.description,
-                    httpx_client=client,
+                tools.append(
+                    KAgentRemoteA2AToolset(
+                        name=remote_agent.name,
+                        description=remote_agent.description,
+                        agent_card_url=f"{remote_agent.url}{AGENT_CARD_WELL_KNOWN_PATH}",
+                        httpx_client=client,
+                    )
                 )
-
-                tools.append(AgentTool(agent=remote_a2a_agent))
 
         code_executor = SandboxedLocalCodeExecutor() if self.execute_code else None
         model = _create_llm_from_model_config(self.model)
@@ -383,6 +417,7 @@ class AgentConfig(BaseModel):
 
         # Build before_tool_callback if any tools require approval
         before_tool_callback = make_approval_callback(tools_requiring_approval) if tools_requiring_approval else None
+        before_model_callback = strip_confirmation_parts_callback if tools_requiring_approval else None
 
         # static_instruction is sent directly to the model without any placeholder processing
         agent = Agent(
@@ -393,6 +428,7 @@ class AgentConfig(BaseModel):
             tools=tools,
             code_executor=code_executor,
             before_tool_callback=before_tool_callback,
+            before_model_callback=before_model_callback,
         )
 
         # Configure memory if enabled
@@ -457,11 +493,52 @@ class AgentConfig(BaseModel):
             logger.error("Failed to inject memory configuration: %s", e)
 
 
+def _transport_kwargs(model_config: BaseLLM) -> dict[str, Any]:
+    """Extract TLS/transport kwargs shared by most model types.
+
+    Returns a dict with api_key_passthrough and TLS fields so callers
+    can spread them with ``**_transport_kwargs(model_config)`` instead of
+    repeating the same four lines in every branch of
+    ``_create_llm_from_model_config``.
+    """
+    kwargs: dict[str, Any] = {}
+    if model_config.api_key_passthrough is not None:
+        kwargs["api_key_passthrough"] = model_config.api_key_passthrough
+    if model_config.tls_disable_verify is not None:
+        kwargs["tls_disable_verify"] = model_config.tls_disable_verify
+    if model_config.tls_ca_cert_path is not None:
+        kwargs["tls_ca_cert_path"] = model_config.tls_ca_cert_path
+    if model_config.tls_disable_system_cas is not None:
+        kwargs["tls_disable_system_cas"] = model_config.tls_disable_system_cas
+    return kwargs
+
+
 def _create_llm_from_model_config(model_config: ModelUnion):
     extra_headers = model_config.headers or {}
     base_url = getattr(model_config, "base_url", None)
 
     if model_config.type == "openai":
+        from .models._token_source import GDCHTokenSource
+
+        token_exchange = None
+        te = model_config.token_exchange
+        if te is not None:
+            if te.type == "GDCHServiceAccount":
+                if te.gdch_service_account is None:
+                    raise ValueError(
+                        "Invalid token_exchange configuration: "
+                        "gdch_service_account is required when token_exchange.type "
+                        "is 'GDCHServiceAccount'"
+                    )
+                token_exchange = GDCHTokenSource(
+                    service_account_path=te.gdch_service_account.service_account_path,
+                    audience=te.gdch_service_account.audience,
+                    ca_cert_path=model_config.tls_ca_cert_path,
+                    tls_disable_verify=model_config.tls_disable_verify or False,
+                )
+            else:
+                raise ValueError(f"Unsupported token_exchange type: {te.type}")
+
         return OpenAINative(
             type="openai",
             base_url=base_url,
@@ -476,17 +553,15 @@ def _create_llm_from_model_config(model_config: ModelUnion):
             temperature=model_config.temperature,
             timeout=model_config.timeout,
             top_p=model_config.top_p,
-            tls_disable_verify=model_config.tls_disable_verify,
-            tls_ca_cert_path=model_config.tls_ca_cert_path,
-            tls_disable_system_cas=model_config.tls_disable_system_cas,
-            api_key_passthrough=model_config.api_key_passthrough,
+            token_exchange=token_exchange,
+            **_transport_kwargs(model_config),
         )
     if model_config.type == "anthropic":
-        return KAgentLiteLlm(
-            model=f"anthropic/{model_config.model}",
+        return KAgentAnthropicLlm(
+            model=model_config.model,
             base_url=base_url,
             extra_headers=extra_headers,
-            api_key_passthrough=model_config.api_key_passthrough,
+            **_transport_kwargs(model_config),
         )
     if model_config.type == "gemini_vertex_ai":
         return GeminiLLM(model=model_config.model)
@@ -494,29 +569,42 @@ def _create_llm_from_model_config(model_config: ModelUnion):
         return ClaudeLLM(model=model_config.model)
     if model_config.type == "ollama":
         ollama_options = _convert_ollama_options(getattr(model_config, "options", None))
-        return KAgentLiteLlm(
-            model=f"ollama_chat/{model_config.model}",
+        # api key passthrough is not applicable for ollama
+        return create_ollama_llm(
+            model=model_config.model,
+            options=ollama_options,
             extra_headers=extra_headers,
-            api_key_passthrough=model_config.api_key_passthrough,
-            **ollama_options,
+            **_transport_kwargs(model_config),
         )
     if model_config.type == "azure_openai":
         return OpenAIAzure(
             model=model_config.model,
             type="azure_openai",
             default_headers=extra_headers,
-            tls_disable_verify=model_config.tls_disable_verify,
-            tls_ca_cert_path=model_config.tls_ca_cert_path,
-            tls_disable_system_cas=model_config.tls_disable_system_cas,
-            api_key_passthrough=model_config.api_key_passthrough,
+            **_transport_kwargs(model_config),
         )
     if model_config.type == "gemini":
-        return model_config.model
-    if model_config.type == "bedrock":
-        return KAgentLiteLlm(
-            model=f"bedrock/{model_config.model}",
+        return KAgentGeminiLlm(
+            model=model_config.model,
             extra_headers=extra_headers,
-            api_key_passthrough=model_config.api_key_passthrough,
+            **_transport_kwargs(model_config),
+        )
+    if model_config.type == "bedrock":
+        return KAgentBedrockLlm(
+            model=model_config.model,
+            extra_headers=extra_headers,
+            additional_model_request_fields=model_config.additional_model_request_fields,
+            **_transport_kwargs(model_config),
+        )
+    if model_config.type == "sap_ai_core":
+        from .models._sap_ai_core import KAgentSAPAICoreLlm
+
+        return KAgentSAPAICoreLlm(
+            model=model_config.model,
+            base_url=base_url,
+            resource_group=model_config.resource_group,
+            auth_url=model_config.auth_url,
+            **_transport_kwargs(model_config),
         )
     raise ValueError(f"Invalid model type: {model_config.type}")
 

@@ -14,6 +14,7 @@ import (
 
 	agenttranslator "github.com/kagent-dev/kagent/go/core/internal/controller/translator/agent"
 	"github.com/kagent-dev/kagent/go/core/internal/database"
+	"github.com/kagent-dev/kagent/go/core/internal/dbtest"
 	"github.com/kagent-dev/kmcp/api/v1alpha1"
 )
 
@@ -25,6 +26,12 @@ func TestReconcileKagentMCPServer_ErrorPropagation(t *testing.T) {
 	scheme := schemev1.Scheme
 	err := v1alpha1.AddToScheme(scheme)
 	require.NoError(t, err)
+
+	if testing.Short() {
+		t.Skip("skipping database test in short mode")
+	}
+
+	connStr := dbtest.StartT(context.Background(), t)
 
 	testCases := []struct {
 		name        string
@@ -78,20 +85,16 @@ func TestReconcileKagentMCPServer_ErrorPropagation(t *testing.T) {
 				WithObjects(tc.mcpServer).
 				Build()
 
-			// Create an in-memory database manager
-			dbManager, err := database.NewManager(&database.Config{
-				DatabaseType: database.DatabaseTypeSqlite,
-				SqliteConfig: &database.SqliteConfig{
-					DatabasePath: "file::memory:?cache=shared",
-				},
+			dbtest.MigrateT(t, connStr, true)
+
+			db, err := database.Connect(context.Background(), &database.PostgresConfig{
+				URL:           connStr,
+				VectorEnabled: true,
 			})
 			require.NoError(t, err)
-			defer dbManager.Close()
+			defer db.Close()
 
-			err = dbManager.Initialize()
-			require.NoError(t, err)
-
-			dbClient := database.NewClient(dbManager)
+			dbClient := database.NewClient(db)
 
 			// Create reconciler
 			translator := agenttranslator.NewAdkApiTranslator(
@@ -99,6 +102,7 @@ func TestReconcileKagentMCPServer_ErrorPropagation(t *testing.T) {
 				types.NamespacedName{Namespace: "test", Name: "default-model"},
 				nil,
 				"",
+				nil,
 			)
 			reconciler := NewKagentReconciler(
 				translator,
@@ -106,6 +110,7 @@ func TestReconcileKagentMCPServer_ErrorPropagation(t *testing.T) {
 				dbClient,
 				types.NamespacedName{Namespace: "test", Name: "default-model"},
 				[]string{}, // No namespace restrictions for tests
+				nil,
 			)
 
 			// Call ReconcileKagentMCPServer

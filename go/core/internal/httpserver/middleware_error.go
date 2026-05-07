@@ -1,13 +1,16 @@
 package httpserver
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 
+	"github.com/jackc/pgx/v5"
 	apierrors "github.com/kagent-dev/kagent/go/core/internal/httpserver/errors"
 	"github.com/kagent-dev/kagent/go/core/internal/httpserver/handlers"
-	"gorm.io/gorm"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -37,6 +40,14 @@ func (w *errorResponseWriter) Flush() {
 	}
 }
 
+func (w *errorResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijacking not supported")
+	}
+	return hijacker.Hijack()
+}
+
 func (w *errorResponseWriter) RespondWithError(err error) {
 	log := ctrllog.FromContext(w.request.Context())
 
@@ -56,7 +67,7 @@ func (w *errorResponseWriter) RespondWithError(err error) {
 		}
 	}
 
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if !errors.Is(err, pgx.ErrNoRows) {
 		log.Error(err, message)
 	} else {
 		log.Info(message)

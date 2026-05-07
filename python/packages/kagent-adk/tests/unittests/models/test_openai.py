@@ -24,6 +24,7 @@ from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from kagent.adk.models import OpenAI
 from kagent.adk.models._openai import (
     _convert_content_to_openai_messages,
+    _convert_openai_response_to_llm_response,
     _convert_tools_to_openai,
 )
 
@@ -543,7 +544,7 @@ def test_openai_client_without_tls_config():
 
 def test_openai_client_with_tls_verification_disabled():
     """Test OpenAI client with TLS verification disabled."""
-    with mock.patch("kagent.adk.models._openai.create_ssl_context") as mock_create_ssl:
+    with mock.patch("kagent.adk.models._ssl.create_ssl_context") as mock_create_ssl:
         with mock.patch("kagent.adk.models._openai.DefaultAsyncHttpxClient") as mock_httpx:
             with mock.patch("kagent.adk.models._openai.AsyncOpenAI") as mock_openai:
                 # create_ssl_context returns False when verification is disabled
@@ -583,7 +584,7 @@ def test_openai_client_with_custom_ca_certificate():
     """Test OpenAI client with custom CA certificate."""
     import ssl
 
-    with mock.patch("kagent.adk.models._openai.create_ssl_context") as mock_create_ssl:
+    with mock.patch("kagent.adk.models._ssl.create_ssl_context") as mock_create_ssl:
         with mock.patch("kagent.adk.models._openai.DefaultAsyncHttpxClient") as mock_httpx:
             with mock.patch("kagent.adk.models._openai.AsyncOpenAI"):
                 # create_ssl_context returns SSLContext for custom CA
@@ -620,7 +621,7 @@ def test_openai_client_with_custom_ca_only():
     """Test OpenAI client with custom CA only (no system CAs)."""
     import ssl
 
-    with mock.patch("kagent.adk.models._openai.create_ssl_context") as mock_create_ssl:
+    with mock.patch("kagent.adk.models._ssl.create_ssl_context") as mock_create_ssl:
         with mock.patch("kagent.adk.models._openai.DefaultAsyncHttpxClient") as mock_httpx:
             with mock.patch("kagent.adk.models._openai.AsyncOpenAI"):
                 mock_ssl_context = mock.MagicMock(spec=ssl.SSLContext)
@@ -676,7 +677,7 @@ def test_azure_openai_client_with_tls():
 
     from kagent.adk.models import AzureOpenAI
 
-    with mock.patch("kagent.adk.models._openai.create_ssl_context") as mock_create_ssl:
+    with mock.patch("kagent.adk.models._ssl.create_ssl_context") as mock_create_ssl:
         with mock.patch("kagent.adk.models._openai.DefaultAsyncHttpxClient") as mock_httpx:
             with mock.patch("kagent.adk.models._openai.AsyncAzureOpenAI") as mock_azure_openai:
                 mock_ssl_context = mock.MagicMock(spec=ssl.SSLContext)
@@ -718,7 +719,7 @@ def test_openai_client_with_base_url_and_tls():
     """Test OpenAI client with base_url (LiteLLM gateway) and TLS configuration."""
     import ssl
 
-    with mock.patch("kagent.adk.models._openai.create_ssl_context") as mock_create_ssl:
+    with mock.patch("kagent.adk.models._ssl.create_ssl_context") as mock_create_ssl:
         with mock.patch("kagent.adk.models._openai.DefaultAsyncHttpxClient") as mock_httpx:
             with mock.patch("kagent.adk.models._openai.AsyncOpenAI"):
                 mock_ssl_context = mock.MagicMock(spec=ssl.SSLContext)
@@ -769,6 +770,39 @@ class TestConvertContentToOpenaiMessages:
                     Part(
                         function_response=types.FunctionResponse(
                             id=tool_call_id,
+                            name="test_tool",
+                            response=response,
+                        )
+                    )
+                ],
+            ),
+        ]
+
+    def _make_contents_with_thought_signature(self, response: dict | str) -> list[Content]:
+        """Helper to create Contents with a function call thought signature and response."""
+        return [
+            types.Content.model_validate(
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "id": "call_abc123",
+                                "name": "test_tool",
+                                "args": {"query": "test"},
+                            },
+                            "thoughtSignature": "YWJj",
+                        }
+                    ],
+                },
+                by_alias=True,
+            ),
+            Content(
+                role="user",
+                parts=[
+                    Part(
+                        function_response=types.FunctionResponse(
+                            id="call_abc123",
                             name="test_tool",
                             response=response,
                         )
@@ -846,3 +880,118 @@ class TestConvertContentToOpenaiMessages:
         tool_messages = [m for m in messages if m["role"] == "tool"]
         assert len(tool_messages) == 1
         assert tool_messages[0]["content"] == "result value"
+
+    def test_preserves_thought_signature_on_tool_call_and_tool_result_messages(self):
+        """Thought signatures must survive the tool-call/tool-result round-trip."""
+        contents = self._make_contents_with_thought_signature({"result": "result value"})
+
+        messages = _convert_content_to_openai_messages(contents)
+
+        assistant_messages = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_messages) == 1
+        assert assistant_messages[0]["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "YWJj"}}
+
+        tool_messages = [m for m in messages if m["role"] == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0]["extra_content"] == {"google": {"thought_signature": "YWJj"}}
+
+
+class TestConvertOpenAIResponseToLlmResponse:
+    class _MockToolCallFunction:
+        def __init__(self, name: str, arguments: str):
+            self.name = name
+            self.arguments = arguments
+
+    class _MockToolCall:
+        def __init__(self, *, tool_call_id: str, name: str, arguments: str, extra_content: dict | None = None):
+            self.id = tool_call_id
+            self.type = "function"
+            self.function = TestConvertOpenAIResponseToLlmResponse._MockToolCallFunction(name, arguments)
+            self.model_extra = {}
+            if extra_content is not None:
+                self.model_extra["extra_content"] = extra_content
+
+    class _MockMessage:
+        def __init__(self, *, content: str | None = None, tool_calls: list | None = None):
+            self.content = content
+            self.role = "assistant"
+            self.tool_calls = tool_calls
+
+    class _MockUsage:
+        def __init__(self):
+            self.prompt_tokens = 3
+            self.completion_tokens = 5
+            self.total_tokens = 8
+
+    class _MockChoice:
+        def __init__(self, message, finish_reason: str = "stop"):
+            self.message = message
+            self.finish_reason = finish_reason
+
+    class _MockResponse:
+        def __init__(self, message):
+            self.choices = [TestConvertOpenAIResponseToLlmResponse._MockChoice(message)]
+            self.usage = TestConvertOpenAIResponseToLlmResponse._MockUsage()
+
+    def test_preserves_thought_signature_from_openai_tool_call_response(self):
+        response = self._MockResponse(
+            self._MockMessage(
+                tool_calls=[
+                    self._MockToolCall(
+                        tool_call_id="call_abc123",
+                        name="test_tool",
+                        arguments='{"query":"test"}',
+                        extra_content={"google": {"thought_signature": "YWJj"}},
+                    )
+                ]
+            )
+        )
+
+        llm_response = _convert_openai_response_to_llm_response(response)
+
+        part = llm_response.content.parts[0]
+        assert part.function_call.id == "call_abc123"
+        assert part.function_call.name == "test_tool"
+        assert part.function_call.args == {"query": "test"}
+        assert part.thought_signature == b"abc"
+
+    def test_round_trip_preserves_thought_signature_for_follow_up_tool_result(self):
+        response = self._MockResponse(
+            self._MockMessage(
+                tool_calls=[
+                    self._MockToolCall(
+                        tool_call_id="call_abc123",
+                        name="test_tool",
+                        arguments='{"query":"test"}',
+                        extra_content={"google": {"thought_signature": "YWJj"}},
+                    )
+                ]
+            )
+        )
+
+        llm_response = _convert_openai_response_to_llm_response(response)
+        contents = [
+            llm_response.content,
+            Content(
+                role="user",
+                parts=[
+                    Part(
+                        function_response=types.FunctionResponse(
+                            id="call_abc123",
+                            name="test_tool",
+                            response={"result": "4"},
+                        )
+                    )
+                ],
+            ),
+        ]
+
+        messages = _convert_content_to_openai_messages(contents)
+
+        assistant_messages = [m for m in messages if m["role"] == "assistant"]
+        assert len(assistant_messages) == 1
+        assert assistant_messages[0]["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "YWJj"}}
+
+        tool_messages = [m for m in messages if m["role"] == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0]["extra_content"] == {"google": {"thought_signature": "YWJj"}}

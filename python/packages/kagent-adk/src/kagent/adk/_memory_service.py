@@ -6,15 +6,14 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
-import numpy as np
 from google.adk.memory import BaseMemoryService
 from google.adk.memory.base_memory_service import SearchMemoryResponse
 from google.adk.memory.memory_entry import MemoryEntry
 from google.adk.models import BaseLlm
 from google.adk.sessions import Session
 from google.genai import types
-from litellm import aembedding
 
+from kagent.adk.models import KAgentEmbedding
 from kagent.adk.types import EmbeddingConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +24,7 @@ class KagentMemoryService(BaseMemoryService):
 
     This service:
     1. Extracts text content from Session events
-    2. Generates embeddings using LiteLLM
+    2. Generates embeddings using provider-specific SDK clients
     3. Stores/searches via Kagent API backed by pgvector
     """
 
@@ -48,6 +47,7 @@ class KagentMemoryService(BaseMemoryService):
         self.client = http_client
         self.embedding_config = embedding_config
         self.ttl_days = ttl_days
+        self._embedding_client = KAgentEmbedding(embedding_config) if embedding_config else None
 
     async def add_session_to_memory(self, session: Session, model: Optional[Any] = None) -> None:
         """Add a session's content to long-term memory (non-blocking).
@@ -58,7 +58,7 @@ class KagentMemoryService(BaseMemoryService):
 
         Args:
             session: The session to add to memory
-            model: Optional ADK model object (e.g., LiteLlm, OpenAI) to use for summarization.
+            model: Optional ADK model object (e.g., OpenAI, KAgentAnthropicLlm) to use for summarization.
         """
         asyncio.create_task(self._add_session_to_memory_background(session, model))
 
@@ -70,7 +70,7 @@ class KagentMemoryService(BaseMemoryService):
 
         Args:
             session: The session to add to memory
-            model: Optional ADK model object (e.g., LiteLlm, OpenAI) to use for summarization.
+            model: Optional ADK model object (e.g., OpenAI, KAgentAnthropicLlm) to use for summarization.
         """
         try:
             # Extract content from session events
@@ -93,14 +93,13 @@ class KagentMemoryService(BaseMemoryService):
             logger.debug("Generating embeddings for %d content items", len(valid_contents))
 
             # Batch generate embeddings
-            vectors = await self._generate_embedding_async(valid_contents)
+            if not self._embedding_client:
+                logger.warning("No embedding client available for session %s", session.id)
+                return
+            vectors = await self._embedding_client.generate(valid_contents)
             if not vectors:
                 logger.warning("Failed to generate embeddings for session %s", session.id)
                 return
-
-            if not isinstance(vectors[0], (list, np.ndarray)):
-                # vectors is a flat list of floats (single vector); wrap it
-                vectors = [vectors]
 
             # Prepare batch items
             batch_items = []
@@ -153,7 +152,10 @@ class KagentMemoryService(BaseMemoryService):
         logger.debug("Adding specific content to memory for user %s", user_id)
 
         # Generate embedding
-        vector = await self._generate_embedding_async(content)
+        if not self._embedding_client:
+            logger.warning("No embedding client available")
+            return
+        vector = await self._embedding_client.generate(content)
         if not vector:
             logger.warning("Failed to generate embedding for memory content")
             return
@@ -196,7 +198,10 @@ class KagentMemoryService(BaseMemoryService):
             SearchMemoryResponse containing matching MemoryEntry objects
         """
         # Generate embedding for the query
-        vector = await self._generate_embedding_async(query)
+        if not self._embedding_client:
+            logger.warning("No embedding client available for search")
+            return SearchMemoryResponse(memories=[])
+        vector = await self._embedding_client.generate(query)
         if not vector:
             logger.warning("Failed to generate embedding for search query")
             return SearchMemoryResponse(memories=[])
@@ -289,84 +294,6 @@ class KagentMemoryService(BaseMemoryService):
 
         return "\n".join(parts)
 
-    def _normalize_l2(self, x):
-        x = np.array(x)
-        if x.ndim == 1:
-            norm = np.linalg.norm(x)
-            if norm == 0:
-                return x
-            return x / norm
-        else:
-            norm = np.linalg.norm(x, 2, axis=1, keepdims=True)
-            return np.where(norm == 0, x, x / norm)
-
-    async def _generate_embedding_async(
-        self, input_data: Union[str, List[str]]
-    ) -> Union[List[float], List[List[float]]]:
-        """Generate embedding vector(s) using LiteLLM.
-
-        Args:
-            input_data: Single string or list of strings to embed.
-
-        Returns:
-            Single vector (List[float]) if input is string,
-            or List of vectors (List[List[float]]) if input is list.
-            Returns empty list on failure.
-        """
-        if not self.embedding_config:
-            logger.warning("No embedding configuration found")
-            return []
-
-        model_name = self.embedding_config.model
-        provider = self.embedding_config.provider
-
-        if not model_name:
-            logger.warning("No embedding model specified in config")
-            return []
-
-        # Build LiteLLM model identifier
-        litellm_model = model_name
-        if provider and provider != "openai" and "/" not in model_name:
-            if provider == "azure_openai":
-                litellm_model = f"azure/{model_name}"
-            elif provider == "ollama":
-                litellm_model = f"ollama/{model_name}"
-            elif provider == "vertex_ai":
-                litellm_model = f"vertex_ai/{model_name}"
-            elif provider == "gemini":
-                litellm_model = f"gemini/{model_name}"
-
-        try:
-            is_batch = isinstance(input_data, list)
-            texts = input_data if is_batch else [input_data]
-
-            # Most Matryoshka Representation Learning embedding models produce embeddings that still have meaning when truncated to specific sizes
-            # https://huggingface.co/blog/matryoshka
-            # We must ensure that embeddings have proper dimensions for compatibility with vector storage backend
-            api_base = self.embedding_config.base_url or None
-            response = await aembedding(model=litellm_model, input=texts, dimensions=768, api_base=api_base)
-
-            embeddings = []
-            for item in response.data:
-                embedding = item["embedding"]
-
-                # LiteLLM does not truncate embeddings by default if the model doesn't support it
-                # However, truncating embeddings is still valid (for most models, see OpenAI's docs and this research https://arxiv.org/html/2508.17744v1)
-                if len(embedding) > 768:
-                    embedding = embedding[:768]
-                    # if we change dimension manually, we need to re-normalize the embeddings
-                    embedding = self._normalize_l2(embedding)
-
-                embeddings.append(embedding)
-
-            if is_batch:
-                return embeddings
-            return embeddings[0] if embeddings else []
-
-        except Exception as e:
-            logger.error("Error generating embedding with model %s: %s", litellm_model, e)
-            return []
-
     async def _summarize_session_content_async(
         self,
         content: str,
@@ -379,7 +306,7 @@ class KagentMemoryService(BaseMemoryService):
 
         Args:
             content: The raw session content to summarize
-            model: Optional ADK model object (e.g., LiteLlm, OpenAI) to use.
+            model: Optional ADK model object (e.g., OpenAI, KAgentAnthropicLlm) to use.
                    If not provided, summarization is skipped.
 
         Returns:

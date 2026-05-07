@@ -12,7 +12,10 @@ from .skill_tool import SkillsTool
 logger = logging.getLogger("kagent_adk." + __name__)
 
 
-def add_skills_tool_to_agent(skills_directory: str | Path, agent: BaseAgent) -> None:
+def add_skills_tool_to_agent(
+    skills_directory: str | Path,
+    agent: BaseAgent,
+) -> None:
     """Utility function to add Skills and Bash tools to a given agent.
 
     Args:
@@ -37,7 +40,7 @@ def add_skills_tool_to_agent(skills_directory: str | Path, agent: BaseAgent) -> 
         logger.debug(f"Added bash tool to agent: {agent.name}")
 
     if "read_file" not in existing_tool_names:
-        agent.tools.append(ReadFileTool())
+        agent.tools.append(ReadFileTool(skills_directory))
         logger.debug(f"Added read file tool to agent: {agent.name}")
 
     if "write_file" not in existing_tool_names:

@@ -10,6 +10,8 @@ interface ModelSelectionSectionProps {
   isSubmitting: boolean;
   onChange?: (modelRef: string) => void;
   agentNamespace?: string;
+  /** `id` on the select trigger (focus management, labels). */
+  selectTriggerId?: string;
 }
 
 export const ModelSelectionSection = ({
@@ -19,7 +21,8 @@ export const ModelSelectionSection = ({
   error,
   isSubmitting,
   onChange,
-  agentNamespace
+  agentNamespace,
+  selectTriggerId = "agent-field-model",
 }: ModelSelectionSectionProps) => {
   const getModelNamespace = (modelRef: string): string => {
     try {
@@ -58,8 +61,12 @@ export const ModelSelectionSection = ({
           }
         }}
       >
-        <SelectTrigger className={`${error ? "border-red-500" : ""}`}>
-          <SelectValue placeholder="Select a model" />
+        <SelectTrigger
+          id={selectTriggerId}
+          className={`${error ? "border-red-500" : ""}`}
+          aria-invalid={!!error}
+        >
+          <SelectValue placeholder="Select a model…" />
         </SelectTrigger>
         <SelectContent>
           {allModels.map((model, idx) => {
@@ -75,7 +82,7 @@ export const ModelSelectionSection = ({
                 className={!selectable ? "opacity-50 cursor-not-allowed" : ""}
               >
                 <div className="flex flex-col">
-                  <span>{model.model} ({model.ref})</span>
+                  <span>{model.spec.model} ({model.ref})</span>
                   {isDifferentNamespace && (
                     <span className="text-xs text-muted-foreground">
                       Change agent namespace to &quot;{modelNamespace}&quot; to use this model

@@ -1,19 +1,116 @@
 export type ChatStatus = "ready" | "thinking" | "error" | "submitted" | "working" | "input_required" | "auth_required" | "processing_tools" | "generating_response";
 
+export interface OpenAIConfig {
+  baseUrl?: string;
+  organization?: string;
+  temperature?: string;
+  maxTokens?: number;
+  topP?: string;
+  frequencyPenalty?: string;
+  presencePenalty?: string;
+  seed?: number;
+  n?: number;
+  timeout?: number;
+  reasoningEffort?: string;
+}
+
+export interface AnthropicConfig {
+  baseUrl?: string;
+  maxTokens?: number;
+  temperature?: string;
+  topP?: string;
+  topK?: number;
+}
+
+export interface AzureOpenAIConfig {
+  azureEndpoint: string;
+  apiVersion: string;
+  azureDeployment?: string;
+  azureAdToken?: string;
+  temperature?: string;
+  maxTokens?: number;
+  topP?: string;
+}
+
+export interface OllamaConfig {
+  host?: string;
+  options?: Record<string, string>;
+}
+
+export interface GeminiConfig {
+  baseUrl?: string;
+  temperature?: string;
+  maxTokens?: number;
+  topP?: string;
+  topK?: number;
+}
+
+export interface GeminiVertexAIConfig {
+  projectID?: string;
+  location?: string;
+  temperature?: string;
+  topP?: string;
+  topK?: number;
+  stopSequences?: string[];
+  maxOutputTokens?: number;
+  candidateCount?: number;
+  responseMimeType?: string;
+}
+
+export interface AnthropicVertexAIConfig {
+  projectID?: string;
+  location?: string;
+  temperature?: string;
+  topP?: string;
+  topK?: number;
+  stopSequences?: string[];
+  maxTokens?: number;
+}
+
+export interface SAPAICoreConfigPayload {
+  baseUrl: string;
+  resourceGroup?: string;
+  authUrl?: string;
+}
+
+export interface BedrockConfig {
+  region: string;
+}
+
+export interface TLSConfig {
+  disableVerify?: boolean;
+  caCertSecretRef?: string;
+  caCertSecretKey?: string;
+  disableSystemCAs?: boolean;
+}
+
+export interface ModelConfigSpec {
+  model: string;
+  provider: string;
+  apiKeySecret?: string;
+  apiKeySecretKey?: string;
+  apiKeyPassthrough?: boolean;
+  defaultHeaders?: Record<string, string>;
+  tls?: TLSConfig;
+  openAI?: OpenAIConfig;
+  anthropic?: AnthropicConfig;
+  azureOpenAI?: AzureOpenAIConfig;
+  ollama?: OllamaConfig;
+  gemini?: GeminiConfig;
+  geminiVertexAI?: GeminiVertexAIConfig;
+  anthropicVertexAI?: AnthropicVertexAIConfig;
+  bedrock?: BedrockConfig;
+  sapAICore?: SAPAICoreConfigPayload;
+}
+
 export interface ModelConfig {
   ref: string;
-  providerName: string;
-  model: string;
-  apiKeySecretRef: string;
-  apiKeySecretKey: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  modelParams?: Record<string, any>; // Optional model-specific parameters
+  spec: ModelConfigSpec;
 }
 
 export interface CreateSessionRequest {
   agent_ref?: string;
   name?: string;
-  user_id: string;
   id?: string;
 }
 
@@ -25,8 +122,8 @@ export interface BaseResponse<T> {
 
 export interface TokenStats {
   total: number;
-  input: number;
-  output: number;
+  prompt: number;
+  completion: number;
 }
 
 export interface Provider {
@@ -59,95 +156,23 @@ export interface ConfiguredModelProviderModelsResponse {
   models: string[];
 }
 
-// Export OpenAIConfigPayload
-export interface OpenAIConfigPayload {
-  baseUrl?: string;
-  organization?: string;
-  temperature?: string;
-  maxTokens?: number;
-  topP?: string;
-  frequencyPenalty?: string;
-  presencePenalty?: string;
-  seed?: number;
-  n?: number;
-  timeout?: number;
-  reasoningEffort?: string;
-}
-
-export interface AnthropicConfigPayload {
-  baseUrl?: string;
-  maxTokens?: number;
-  temperature?: string;
-  topP?: string;
-  topK?: number;
-}
-
-export interface AzureOpenAIConfigPayload {
-  azureEndpoint: string
-  apiVersion: string;
-  azureDeployment?: string;
-  azureAdToken?: string;
-  temperature?: string;
-  maxTokens?: number;
-  topP?: string;
-}
-
-export interface OllamaConfigPayload {
-  host?: string;
-  options?: Record<string, string>;
-}
-
-export interface GeminiConfigPayload {
-  baseUrl?: string;
-  temperature?: string;
-  maxTokens?: number;
-  topP?: string;
-  topK?: number;
-}
-
-export interface GeminiVertexAIConfigPayload {
-  project?: string;
-  location?: string;
-  temperature?: string;
-  maxTokens?: number;
-  topP?: string;
-  topK?: number;
-}
-
-export interface AnthropicVertexAIConfigPayload {
-  project?: string;
-  location?: string;
-  temperature?: string;
-  maxTokens?: number;
-  topP?: string;
-  topK?: number;
+export interface SecretMaterial {
+  name: string;
+  key: string;
+  value: string;
 }
 
 export interface CreateModelConfigRequest {
   ref: string;
-  provider: Pick<Provider, "name" | "type">;
-  model: string;
-  apiKey: string;
-  openAI?: OpenAIConfigPayload;
-  anthropic?: AnthropicConfigPayload;
-  azureOpenAI?: AzureOpenAIConfigPayload;
-  ollama?: OllamaConfigPayload;
-  gemini?: GeminiConfigPayload;
-  geminiVertexAI?: GeminiVertexAIConfigPayload;
-  anthropicVertexAI?: AnthropicVertexAIConfigPayload;
+  apiKey?: string;
+  spec: ModelConfigSpec;
+  secrets?: SecretMaterial[];
 }
 
 export interface UpdateModelConfigPayload {
-  provider: Pick<Provider, "name" | "type">;
-  model: string;
   apiKey?: string | null;
-  openAI?: OpenAIConfigPayload;
-  anthropic?: AnthropicConfigPayload;
-  azureOpenAI?: AzureOpenAIConfigPayload;
-  ollama?: OllamaConfigPayload;
-  gemini?: GeminiConfigPayload;
-  geminiVertexAI?: GeminiVertexAIConfigPayload;
-  anthropicVertexAI?: AnthropicVertexAIConfigPayload;
+  spec: ModelConfigSpec;
+  secrets?: SecretMaterial[];
 }
 
 /**
@@ -208,6 +233,9 @@ export interface ToolsResponse {
 export interface ResourceMetadata {
   name: string;
   namespace?: string;
+  /** ISO/RFC3339 from Kubernetes `metadata.creationTimestamp` */
+  creationTimestamp?: string;
+  resourceVersion?: string;
 }
 
 export type ToolProviderType = "McpServer" | "Agent"
@@ -230,11 +258,29 @@ export interface McpServerTool extends TypedLocalReference {
   requireApproval?: string[];
 }
 
-export type AgentType = "Declarative" | "BYO";
+export type AgentType = "Declarative" | "BYO" | "Sandbox" | "OpenClawSandbox";
+
+/** Single Git repository source for skills. */
+export interface GitRepo {
+  url: string;
+  ref?: string;
+  path?: string;
+  name?: string;
+}
 
 export interface SkillForAgent {
   insecureSkipVerify?: boolean;
   refs?: string[];
+  gitAuthSecretRef?: { name: string };
+  gitRefs?: GitRepo[];
+}
+
+/** Kubernetes SandboxAgent CRD (kagent.dev/v1alpha2). Spec matches Agent.spec (AgentSpec). */
+export interface SandboxAgent {
+  apiVersion?: string;
+  kind?: string;
+  metadata: ResourceMetadata;
+  spec: AgentSpec;
 }
 
 export interface AgentSpec {
@@ -250,7 +296,38 @@ export interface DeclarativeDeploymentSpec {
   serviceAccountName?: string;
 }
 
+/** Prompt library sources referenced for {{include "alias/key"}} in system messages. */
+export interface PromptSource {
+  kind: string;
+  name: string;
+  apiGroup?: string;
+  alias?: string;
+}
+
+export interface PromptTemplateSpec {
+  dataSources?: PromptSource[];
+}
+
+export interface PromptTemplateSummary {
+  namespace: string;
+  name: string;
+  keyCount: number;
+  /** Fragment keys per library (for @ include picker). */
+  keys?: string[];
+}
+
+export interface PromptTemplateDetail {
+  namespace: string;
+  name: string;
+  data: Record<string, string>;
+}
+
+/** Which ADK implementation runs the agent (Kubernetes `spec.declarative.runtime`). */
+export type DeclarativeRuntime = "python" | "go";
+
 export interface DeclarativeAgentSpec {
+  /** ADK implementation: Python (default) or Go (faster cold start). */
+  runtime?: DeclarativeRuntime;
   systemMessage: string;
   tools: Tool[];
   // Name of the model config resource
@@ -259,6 +336,10 @@ export interface DeclarativeAgentSpec {
   a2aConfig?: A2AConfig;
   context?: ContextConfig;
   deployment?: DeclarativeDeploymentSpec;
+  /** Long-term memory (same shape as Kubernetes declarative spec). */
+  memory?: MemorySpec;
+  /** When set, systemMessage is rendered as a Go text/template with includes and variables. */
+  promptTemplate?: PromptTemplateSpec;
 }
 
 export interface ContextConfig {
@@ -320,12 +401,35 @@ export interface AgentSkill {
 
 
 export interface Agent {
+  apiVersion?: string;
+  kind?: string;
   metadata: ResourceMetadata;
   spec: AgentSpec;
+  status?: {
+    observedGeneration?: number;
+    conditions?: Array<{
+      type: string;
+      status: string;
+      reason?: string;
+      message?: string;
+      /** RFC3339 from `lastTransitionTime` on Agent conditions */
+      lastTransitionTime?: string;
+    }>;
+  };
+}
+
+/** Merged into GET /api/agents for kagent.dev/v1alpha2 AgentHarness (openshell). */
+export interface OpenshellAgentHarnessListEntry {
+  backend: string;
+  /** Gateway sandbox name for SSH (`namespace-name`); pass as `/openshell` `sandbox` query param. */
+  gatewaySandboxName: string;
+  modelConfigRef?: string;
+  backendRefId?: string;
+  endpoint?: string;
 }
 
 export interface AgentResponse {
-  id: number;
+  id: number | string;
   agent: Agent;
   model: string;
   modelProvider: string;
@@ -333,6 +437,8 @@ export interface AgentResponse {
   tools: Tool[];
   deploymentReady: boolean;
   accepted: boolean;
+  workloadMode?: "deployment" | "sandbox";
+  openshellAgentHarness?: OpenshellAgentHarnessListEntry;
 }
 
 export interface RemoteMCPServer {
@@ -447,4 +553,75 @@ export interface AgentMemory {
   access_count: number;
   created_at: string;
   expires_at?: string;
+}
+
+// ---------------------------------------------------------------------------
+// HITL (Human-in-the-Loop) types
+//
+// These mirror the Python models in kagent-core/a2a/_hitl_utils.py and describe the
+// A2A - UI wire format for request and decision paths in HITL flow.
+// ---------------------------------------------------------------------------
+
+/** A single tool approval decision value. */
+export type ToolDecision = "approve" | "reject";
+
+/**
+ * The resolved approval decision stored on a ToolApprovalRequest message.
+ * - A single ToolDecision string for uniform decisions (all approve or all reject).
+ * - A per-tool map (keyed by tool call ID) for batch/mixed decisions.
+ */
+export type ApprovalDecision = ToolDecision | Record<string, ToolDecision>;
+
+// The original tool function call that requires human approval.
+export interface HitlOriginalFunctionCall {
+  name: string;
+  args: Record<string, unknown>;
+  id?: string;
+}
+
+// Payload stored inside the toolConfirmation field of an adk_request_confirmation DataPart.
+export interface HitlToolConfirmationPayload {
+  /**
+   * For subagent HITL: serialized HitlPartInfo[] from the subagent's own
+   * input_required DataParts (see KAgentRemoteA2ATool._handle_input_required).
+   * Each entry has the same shape as AdkRequestConfirmationData (without
+   * toolConfirmation, since those are leaf-level tool calls).
+   */
+  hitl_parts?: HitlPartInfo[];
+  // The subagent name, set by KAgentRemoteA2ATool.
+  subagent_name?: string;
+  // Subagent task_id stored for the resume path.
+  task_id?: string;
+  // Subagent context_id stored for the resume path.
+  context_id?: string;
+}
+
+// The toolConfirmation field of an adk_request_confirmation DataPart.
+export interface HitlToolConfirmation {
+  hint?: string;
+  confirmed?: boolean;
+  payload?: HitlToolConfirmationPayload;
+}
+
+// Args of the adk_request_confirmation FunctionCall.
+export interface HitlRequestConfirmationArgs {
+  originalFunctionCall: HitlOriginalFunctionCall;
+  toolConfirmation?: HitlToolConfirmation;
+}
+
+// A single serialized HitlPartInfo — the data dict of an adk_request_confirmation DataPart.
+export interface HitlPartInfo {
+  // Always "adk_request_confirmation".
+  name: string;
+  // The confirmation function-call ID (distinct from the original FC ID).
+  id?: string;
+  // The original tool call that requires approval.
+  originalFunctionCall: HitlOriginalFunctionCall;
+}
+
+// The full data payload of an adk_request_confirmation DataPart, as produced by the ADK event converter and read by the UI.
+export interface AdkRequestConfirmationData {
+  name: string;
+  id: string;
+  args: HitlRequestConfirmationArgs;
 }

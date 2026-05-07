@@ -3,11 +3,26 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from "react";
 import { getAgent as getAgentAction, createAgent, getAgents } from "@/app/actions/agents";
 import { getTools } from "@/app/actions/tools";
-import type { Agent, Tool, AgentResponse, BaseResponse, ModelConfig, ToolsResponse, AgentType, EnvVar, ContextConfig } from "@/types";
+import type {
+  Agent,
+  Tool,
+  AgentResponse,
+  BaseResponse,
+  ModelConfig,
+  ToolsResponse,
+  AgentType,
+  EnvVar,
+  ContextConfig,
+  GitRepo,
+  DeclarativeRuntime,
+} from "@/types";
 import { getModelConfigs } from "@/app/actions/modelConfigs";
+import { formUsesByoSections, formUsesDeclarativeSections } from "@/lib/agentFormLayout";
+import type { OpenClawSandboxFormSlice } from "@/lib/openClawSandboxForm";
+import { validateOpenClawSandboxForm } from "@/lib/openClawSandboxForm";
 import { isResourceNameValid } from "@/lib/utils";
 
-interface ValidationErrors {
+export interface ValidationErrors {
   name?: string;
   namespace?: string;
   description?: string;
@@ -20,6 +35,8 @@ interface ValidationErrors {
   memoryModel?: string;
   memoryTtl?: string;
   serviceAccountName?: string;
+  promptSources?: string;
+  openClawSandbox?: string;
 }
 
 export interface AgentFormData {
@@ -27,13 +44,17 @@ export interface AgentFormData {
   namespace: string;
   description: string;
   type?: AgentType;
+  /** Python vs Go ADK for declarative / sandbox (non-BYO) workloads. */
+  declarativeRuntime?: DeclarativeRuntime;
   // Declarative fields
   systemPrompt?: string;
   modelName?: string;
   tools: Tool[];
   stream?: boolean;
-  // Skills
+  // Skills (OCI container refs and/or Git repositories; at least one list may be set)
   skillRefs?: string[];
+  skillGitRepos?: GitRepo[];
+  skillsGitAuthSecretName?: string;
   // Memory
   memory?: {
     modelConfig?: string;
@@ -41,6 +62,9 @@ export interface AgentFormData {
   };
   // Context management
   context?: ContextConfig;
+  promptSources?: Array<{ name: string; alias: string }>;
+  /** OpenClaw AgentHarness CR (kagent.dev/v1alpha2 AgentHarness; backend openclaw). */
+  openClawSandbox?: OpenClawSandboxFormSlice;
   // BYO fields
   byoImage?: string;
   byoCmd?: string;
@@ -57,7 +81,7 @@ export interface AgentFormData {
   serviceAccountName?: string;
 }
 
-interface AgentsContextType {
+export interface AgentsContextType {
   agents: AgentResponse[];
   models: ModelConfig[];
   loading: boolean;
@@ -72,7 +96,7 @@ interface AgentsContextType {
   validateAgentData: (data: Partial<AgentFormData>) => ValidationErrors;
 }
 
-const AgentsContext = createContext<AgentsContextType | undefined>(undefined);
+export const AgentsContext = createContext<AgentsContextType | undefined>(undefined);
 
 export function useAgents() {
   const context = useContext(AgentsContext);
@@ -82,7 +106,7 @@ export function useAgents() {
   return context;
 }
 
-interface AgentsProviderProps {
+export interface AgentsProviderProps {
   children: ReactNode;
 }
 
@@ -162,12 +186,31 @@ export function AgentsProvider({ children }: AgentsProviderProps) {
       }
     }
 
-    if (data.description !== undefined && !data.description.trim()) {
+    const type = data.type || "Declarative";
+
+    if (data.description !== undefined && !data.description.trim() && type !== "OpenClawSandbox") {
       errors.description = "Description is required";
     }
 
-    const type = data.type || "Declarative";
-    if (type === "Declarative") {
+    const byoImage = data.byoImage;
+
+    if (type === "OpenClawSandbox") {
+      if (!data.modelName || data.modelName.trim() === "") {
+        errors.model = "Please select a model config";
+      }
+      if (data.openClawSandbox !== undefined) {
+        const oc = validateOpenClawSandboxForm({
+          openClaw: data.openClawSandbox,
+          modelRef: data.modelName,
+        });
+        if (oc) {
+          errors.openClawSandbox = oc;
+        }
+      }
+      return errors;
+    }
+
+    if (formUsesDeclarativeSections(type, byoImage)) {
       if (data.systemPrompt !== undefined && !data.systemPrompt.trim()) {
         errors.systemPrompt = "Agent instructions are required";
       }
@@ -183,7 +226,7 @@ export function AgentsProvider({ children }: AgentsProviderProps) {
           errors.memoryTtl = "TTL must be at least 1 day";
         }
       }
-    } else if (type === "BYO") {
+    } else if (formUsesByoSections(type, byoImage)) {
       if (!data.byoImage || data.byoImage.trim() === "") {
         errors.model = "Container image is required";
       }
@@ -193,6 +236,21 @@ export function AgentsProvider({ children }: AgentsProviderProps) {
       const trimmedSA = data.serviceAccountName.trim();
       if (trimmedSA && !isResourceNameValid(trimmedSA)) {
         errors.serviceAccountName = `Service account name can only contain lowercase alphanumeric characters, "-" or ".", and must start and end with an alphanumeric character`;
+      }
+    }
+
+    if (formUsesDeclarativeSections(type, byoImage)) {
+      const sources = (data.promptSources || []).filter((s) => s.name.trim());
+      for (const s of sources) {
+        if (!isResourceNameValid(s.name.trim())) {
+          errors.promptSources = `Prompt library name is invalid: ${s.name}`;
+          break;
+        }
+        const al = s.alias.trim();
+        if (al && !isResourceNameValid(al)) {
+          errors.promptSources = `Alias is invalid: ${s.alias}`;
+          break;
+        }
       }
     }
 
@@ -211,7 +269,7 @@ export function AgentsProvider({ children }: AgentsProviderProps) {
       }
 
       const agent = agentResult.data;
-      
+
       if (!agent) {
         console.warn(`Agent with name ${name} and namespace ${namespace} not found`);
         return null;

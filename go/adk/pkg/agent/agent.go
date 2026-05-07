@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kagent-dev/kagent/go/adk/pkg/mcp"
 	"github.com/kagent-dev/kagent/go/adk/pkg/models"
+	"github.com/kagent-dev/kagent/go/adk/pkg/tools"
 	"github.com/kagent-dev/kagent/go/api/adk"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
@@ -29,53 +30,96 @@ const (
 )
 
 // CreateGoogleADKAgent creates a Google ADK agent from AgentConfig.
-// Toolsets are passed in directly (created by mcp.CreateToolsets).
 // agentName is used as the ADK agent identity (appears in event Author field).
 // extraTools are appended to the agent's tool list (e.g. save_memory).
 func CreateGoogleADKAgent(ctx context.Context, agentConfig *adk.AgentConfig, agentName string, extraTools ...tool.Tool) (agent.Agent, error) {
+	a, _, err := CreateGoogleADKAgentWithSubagentSessionIDs(ctx, agentConfig, agentName, extraTools...)
+	return a, err
+}
+
+// CreateGoogleADKAgentWithSubagentSessionIDs creates a Google ADK agent and a
+// map of remote-subagent tool name → A2A context session ID (for stamping
+// outbound A2A events). Callers that only need the agent can use
+// CreateGoogleADKAgent.
+func CreateGoogleADKAgentWithSubagentSessionIDs(ctx context.Context, agentConfig *adk.AgentConfig, agentName string, extraTools ...tool.Tool) (agent.Agent, map[string]string, error) {
 	log := logr.FromContextOrDiscard(ctx)
 
 	if agentConfig == nil {
-		return nil, fmt.Errorf("agent config is required")
+		return nil, nil, fmt.Errorf("agent config is required")
 	}
 
 	toolsets := mcp.CreateToolsets(ctx, agentConfig.HttpTools, agentConfig.SseTools)
+	subagentSessionIDs := make(map[string]string)
 
-	// Add memory tools if memory is configured
-	var memoryTools []tool.Tool
-	if agentConfig.Memory != nil {
-		log.Info("Memory configuration detected, adding memory tools")
-		memoryTools = []tool.Tool{
-			preloadmemorytool.New(),
-			loadmemorytool.New(),
+	var remoteAgentTools []tool.Tool
+	for _, remoteAgent := range agentConfig.RemoteAgents {
+		if remoteAgent.Url == "" {
+			log.Info("Skipping remote agent with empty URL", "name", remoteAgent.Name)
+			continue
 		}
+		remoteTool, sessionID, err := tools.NewKAgentRemoteA2ATool(remoteAgent.Name, remoteAgent.Description, remoteAgent.Url, nil, remoteAgent.Headers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create remote A2A tool for %s: %w", remoteAgent.Name, err)
+		}
+		if sessionID != "" {
+			subagentSessionIDs[remoteAgent.Name] = sessionID
+		}
+		remoteAgentTools = append(remoteAgentTools, remoteTool)
+		log.Info("Wired remote A2A agent tool", "name", remoteAgent.Name, "url", remoteAgent.Url)
 	}
-	memoryTools = append(memoryTools, extraTools...)
+
+	localTools, err := buildAgentTools(agentConfig, remoteAgentTools, extraTools, log)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	if agentConfig.Model == nil {
-		return nil, fmt.Errorf("model configuration is required")
+		return nil, nil, fmt.Errorf("model configuration is required")
 	}
 
 	llmModel, err := CreateLLM(ctx, agentConfig.Model, log)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create LLM: %w", err)
+		return nil, nil, fmt.Errorf("failed to create LLM: %w", err)
 	}
 
 	if agentName == "" {
 		agentName = "agent"
 	}
 
+	// Collect tool names that require approval from HttpTools and SseTools.
+	approvalSet := make(map[string]bool)
+	for _, ht := range agentConfig.HttpTools {
+		for _, name := range ht.RequireApproval {
+			approvalSet[name] = true
+		}
+	}
+	for _, st := range agentConfig.SseTools {
+		for _, name := range st.RequireApproval {
+			approvalSet[name] = true
+		}
+	}
+
+	// Build BeforeToolCallbacks. Approval gating runs first.
+	beforeToolCallbacks := []llmagent.BeforeToolCallback{}
+	// Strip synthetic HITL tool messages from the model request to avoid unnecessary token usage.
+	beforeModelCallbacks := []llmagent.BeforeModelCallback{}
+	if len(approvalSet) > 0 {
+		log.Info("Wiring approval callback", "toolCount", len(approvalSet))
+		beforeToolCallbacks = append(beforeToolCallbacks, MakeApprovalCallback(approvalSet))
+		beforeModelCallbacks = append(beforeModelCallbacks, MakeStripConfirmationPartsCallback())
+	}
+	beforeToolCallbacks = append(beforeToolCallbacks, makeBeforeToolCallback(log))
+
 	llmAgentConfig := llmagent.Config{
-		Name:            agentName,
-		Description:     agentConfig.Description,
-		Instruction:     agentConfig.Instruction,
-		Model:           llmModel,
-		IncludeContents: llmagent.IncludeContentsDefault,
-		Tools:           memoryTools,
-		Toolsets:        toolsets,
-		BeforeToolCallbacks: []llmagent.BeforeToolCallback{
-			makeBeforeToolCallback(log),
-		},
+		Name:                 agentName,
+		Description:          agentConfig.Description,
+		Instruction:          agentConfig.Instruction,
+		Model:                llmModel,
+		IncludeContents:      llmagent.IncludeContentsDefault,
+		Tools:                localTools,
+		Toolsets:             toolsets,
+		BeforeToolCallbacks:  beforeToolCallbacks,
+		BeforeModelCallbacks: beforeModelCallbacks,
 		AfterToolCallbacks: []llmagent.AfterToolCallback{
 			makeAfterToolCallback(log),
 		},
@@ -93,14 +137,44 @@ func CreateGoogleADKAgent(ctx context.Context, agentConfig *adk.AgentConfig, age
 
 	llmAgent, err := llmagent.New(llmAgentConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create LLM agent: %w", err)
+		return nil, nil, fmt.Errorf("failed to create LLM agent: %w", err)
 	}
 
 	log.Info("Successfully created Google ADK LLM agent",
 		"toolsCount", len(llmAgentConfig.Tools),
 		"toolsetsCount", len(llmAgentConfig.Toolsets))
 
-	return llmAgent, nil
+	return llmAgent, subagentSessionIDs, nil
+}
+
+func buildAgentTools(agentConfig *adk.AgentConfig, remoteAgentTools, extraTools []tool.Tool, log logr.Logger) ([]tool.Tool, error) {
+	var localTools []tool.Tool
+	if agentConfig.Memory != nil {
+		log.Info("Memory configuration detected, adding memory tools")
+		localTools = []tool.Tool{
+			preloadmemorytool.New(),
+			loadmemorytool.New(),
+		}
+	}
+	localTools = append(localTools, remoteAgentTools...)
+	localTools = append(localTools, extraTools...)
+
+	skillsDirectory := strings.TrimSpace(os.Getenv("KAGENT_SKILLS_FOLDER"))
+	if skillsDirectory != "" {
+		skillsTools, err := tools.NewSkillsTools(skillsDirectory)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create skills tools: %w", err)
+		}
+		localTools = append(localTools, skillsTools...)
+		log.Info("Wired local skills tools", "skillsDirectory", skillsDirectory, "toolCount", len(skillsTools))
+	}
+
+	askUserTool, err := tools.NewAskUserTool()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ask_user tool: %w", err)
+	}
+	localTools = append(localTools, askUserTool)
+	return localTools, nil
 }
 
 // CreateLLM creates an adkmodel.LLM from the model configuration.
@@ -109,9 +183,9 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 	switch m := m.(type) {
 	case *adk.OpenAI:
 		cfg := &models.OpenAIConfig{
+			TransportConfig:  transportConfigFromBase(m.BaseModel, m.Timeout),
 			Model:            m.Model,
 			BaseUrl:          m.BaseUrl,
-			Headers:          extractHeaders(m.Headers),
 			FrequencyPenalty: m.FrequencyPenalty,
 			MaxTokens:        m.MaxTokens,
 			N:                m.N,
@@ -119,16 +193,14 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 			ReasoningEffort:  m.ReasoningEffort,
 			Seed:             m.Seed,
 			Temperature:      m.Temperature,
-			Timeout:          m.Timeout,
 			TopP:             m.TopP,
 		}
 		return models.NewOpenAIModelWithLogger(cfg, log)
 
 	case *adk.AzureOpenAI:
 		cfg := &models.AzureOpenAIConfig{
-			Model:   m.Model,
-			Headers: extractHeaders(m.Headers),
-			Timeout: nil,
+			TransportConfig: transportConfigFromBase(m.BaseModel, nil),
+			Model:           m.Model,
 		}
 		return models.NewAzureOpenAIModelWithLogger(cfg, log)
 
@@ -144,7 +216,14 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 		if modelName == "" {
 			modelName = DefaultGeminiModel
 		}
-		return adkgemini.NewModel(ctx, modelName, &genai.ClientConfig{APIKey: apiKey})
+		httpClient, err := models.BuildHTTPClient(transportConfigFromBase(m.BaseModel, nil))
+		if err != nil {
+			return nil, fmt.Errorf("failed to build HTTP client for Gemini: %w", err)
+		}
+		return adkgemini.NewModel(ctx, modelName, &genai.ClientConfig{
+			APIKey:     apiKey,
+			HTTPClient: httpClient,
+		})
 
 	case *adk.GeminiVertexAI:
 		project := os.Getenv("GOOGLE_CLOUD_PROJECT")
@@ -171,14 +250,13 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 			modelName = DefaultAnthropicModel
 		}
 		cfg := &models.AnthropicConfig{
-			Model:       modelName,
-			BaseUrl:     m.BaseUrl,
-			Headers:     extractHeaders(m.Headers),
-			MaxTokens:   m.MaxTokens,
-			Temperature: m.Temperature,
-			TopP:        m.TopP,
-			TopK:        m.TopK,
-			Timeout:     m.Timeout,
+			TransportConfig: transportConfigFromBase(m.BaseModel, m.Timeout),
+			Model:           modelName,
+			BaseUrl:         m.BaseUrl,
+			MaxTokens:       m.MaxTokens,
+			Temperature:     m.Temperature,
+			TopP:            m.TopP,
+			TopK:            m.TopK,
 		}
 		return models.NewAnthropicModelWithLogger(cfg, log)
 
@@ -187,15 +265,18 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 		if baseURL == "" {
 			baseURL = "http://localhost:11434"
 		}
-		baseURL = strings.TrimSuffix(baseURL, "/")
-		if !strings.HasSuffix(baseURL, "/v1") {
-			baseURL += "/v1"
-		}
 		modelName := m.Model
 		if modelName == "" {
 			modelName = DefaultOllamaModel
 		}
-		return models.NewOpenAICompatibleModelWithLogger(baseURL, modelName, extractHeaders(m.Headers), "", log)
+		// Create OllamaConfig with native SDK support for Ollama-specific options
+		cfg := &models.OllamaConfig{
+			TransportConfig: transportConfigFromBase(m.BaseModel, nil),
+			Model:           modelName,
+			Host:            baseURL,
+			Options:         m.Options,
+		}
+		return models.NewOllamaModelWithLogger(cfg, log)
 
 	case *adk.Bedrock:
 		region := m.Region
@@ -209,11 +290,14 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 		if modelName == "" {
 			return nil, fmt.Errorf("bedrock requires a model name (e.g. anthropic.claude-3-sonnet-20240229-v1:0)")
 		}
-		cfg := &models.AnthropicConfig{
-			Model:   modelName,
-			Headers: extractHeaders(m.Headers),
+		// Use Bedrock Converse API for ALL models (including Anthropic)
+		cfg := &models.BedrockConfig{
+			TransportConfig:              transportConfigFromBase(m.BaseModel, nil),
+			Model:                        modelName,
+			Region:                       region,
+			AdditionalModelRequestFields: m.AdditionalModelRequestFields,
 		}
-		return models.NewAnthropicBedrockModelWithLogger(ctx, cfg, region, log)
+		return models.NewBedrockModelWithLogger(ctx, cfg, log)
 
 	case *adk.GeminiAnthropic:
 		// GeminiAnthropic = Claude models accessed through Google Cloud Vertex AI.
@@ -231,13 +315,35 @@ func CreateLLM(ctx context.Context, m adk.Model, log logr.Logger) (adkmodel.LLM,
 			modelName = DefaultAnthropicModel
 		}
 		cfg := &models.AnthropicConfig{
-			Model:   modelName,
-			Headers: extractHeaders(m.Headers),
+			TransportConfig: transportConfigFromBase(m.BaseModel, nil),
+			Model:           modelName,
 		}
 		return models.NewAnthropicVertexAIModelWithLogger(ctx, cfg, region, project, log)
 
+	case *adk.SAPAICore:
+		cfg := models.SAPAICoreConfig{
+			Model:         m.Model,
+			BaseUrl:       m.BaseUrl,
+			ResourceGroup: m.ResourceGroup,
+			AuthUrl:       m.AuthUrl,
+			Headers:       extractHeaders(m.Headers),
+		}
+		return models.NewSAPAICoreModelWithLogger(cfg, log)
+
 	default:
 		return nil, fmt.Errorf("unsupported model type: %s", m.GetType())
+	}
+}
+
+// transportConfigFromBase builds a TransportConfig from the shared BaseModel fields.
+func transportConfigFromBase(b adk.BaseModel, timeout *int) models.TransportConfig {
+	return models.TransportConfig{
+		Headers:               extractHeaders(b.Headers),
+		TLSInsecureSkipVerify: b.TLSInsecureSkipVerify,
+		TLSCACertPath:         b.TLSCACertPath,
+		TLSDisableSystemCAs:   b.TLSDisableSystemCAs,
+		APIKeyPassthrough:     b.APIKeyPassthrough,
+		Timeout:               timeout,
 	}
 }
 

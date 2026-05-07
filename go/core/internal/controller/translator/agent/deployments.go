@@ -46,6 +46,7 @@ type resolvedDeployment struct {
 	PodSecurityContext   *corev1.PodSecurityContext
 	ServiceAccountName   *string
 	ServiceAccountConfig *v1alpha2.ServiceAccountConfig
+	ExtraContainers      []corev1.Container
 }
 
 // getDefaultResources sets default resource requirements if not specified
@@ -71,6 +72,9 @@ func getDefaultLabels(agentName string, incoming map[string]string) map[string]s
 		labels.AppPartOf:    labels.ManagedByKagent,
 		labels.AppName:      agentName,
 	}
+	// Global default labels (from --default-agent-pod-labels flag) override built-in defaults
+	maps.Copy(defaultLabels, DefaultAgentPodLabels)
+	// Per-agent labels override global defaults
 	maps.Copy(defaultLabels, incoming)
 	return defaultLabels
 }
@@ -102,30 +106,48 @@ func getRuntimeImageRepository(runtime v1alpha2.DeclarativeRuntime) string {
 	}
 }
 
-func resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*resolvedDeployment, error) {
+// validateExtraContainers checks that none of the extra containers use the
+// reserved name "kagent" and that no two containers share the same name.
+func validateExtraContainers(containers []corev1.Container) error {
+	seen := make(map[string]bool)
+	for _, c := range containers {
+		if c.Name == "kagent" {
+			return fmt.Errorf("extraContainers: %q is a reserved container name", c.Name)
+		}
+		if seen[c.Name] {
+			return fmt.Errorf("extraContainers: duplicate container name %q", c.Name)
+		}
+		seen[c.Name] = true
+	}
+	return nil
+}
+
+func resolveInlineDeployment(agent v1alpha2.AgentObject, mdd *modelDeploymentData) (*resolvedDeployment, error) {
+	specRef := agent.GetAgentSpec()
 	// Defaults
 	port := int32(8080)
 	args := []string{
 		"--host",
-		"0.0.0.0",
+		DefaultAgentBindHost,
 		"--port",
 		fmt.Sprintf("%d", port),
 		"--filepath",
 		"/config",
 	}
 
-	serviceAccountName := new(agent.Name)
+	serviceAccountName := new(string)
+	*serviceAccountName = agent.GetName()
 
 	// Start with spec deployment spec
 	spec := v1alpha2.DeclarativeDeploymentSpec{}
-	if agent.Spec.Declarative.Deployment != nil {
-		spec = *agent.Spec.Declarative.Deployment
+	if specRef.Declarative.Deployment != nil {
+		spec = *specRef.Declarative.Deployment
 	}
 
 	// Determine runtime (defaults to python if not set)
 	runtime := v1alpha2.DeclarativeRuntime_Python
-	if agent.Spec.Declarative.Runtime != "" {
-		runtime = agent.Spec.Declarative.Runtime
+	if specRef.Declarative.Runtime != "" {
+		runtime = specRef.Declarative.Runtime
 	}
 
 	// Get registry
@@ -134,10 +156,14 @@ func resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*
 		registry = spec.ImageRegistry
 	}
 
-	// Get repository based on runtime
 	repository := getRuntimeImageRepository(runtime)
 
-	image := fmt.Sprintf("%s/%s:%s", registry, repository, DefaultImageConfig.Tag)
+	tag := DefaultImageConfig.Tag
+	if runtime == v1alpha2.DeclarativeRuntime_Go && needsSRTSettings(agent, specRef.Sandbox) {
+		tag += "-full"
+	}
+
+	image := fmt.Sprintf("%s/%s:%s", registry, repository, tag)
 
 	imagePullPolicy := corev1.PullPolicy(DefaultImageConfig.PullPolicy)
 	if spec.ImagePullPolicy != "" {
@@ -152,6 +178,10 @@ func resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*
 		}
 	}
 
+	if err := validateExtraContainers(spec.ExtraContainers); err != nil {
+		return nil, err
+	}
+
 	dep := &resolvedDeployment{
 		Image:                image,
 		Args:                 args,
@@ -161,7 +191,7 @@ func resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*
 		ImagePullSecrets:     slices.Clone(spec.ImagePullSecrets),
 		Volumes:              append(slices.Clone(spec.Volumes), mdd.Volumes...),
 		VolumeMounts:         append(slices.Clone(spec.VolumeMounts), mdd.VolumeMounts...),
-		Labels:               getDefaultLabels(agent.Name, spec.Labels),
+		Labels:               getDefaultLabels(agent.GetName(), spec.Labels),
 		Annotations:          maps.Clone(spec.Annotations),
 		Env:                  append(slices.Clone(spec.Env), mdd.EnvVars...),
 		Resources:            getDefaultResources(spec.Resources), // Set default resources if not specified
@@ -172,6 +202,7 @@ func resolveInlineDeployment(agent *v1alpha2.Agent, mdd *modelDeploymentData) (*
 		PodSecurityContext:   spec.PodSecurityContext,
 		ServiceAccountName:   spec.ServiceAccountName,
 		ServiceAccountConfig: spec.ServiceAccountConfig,
+		ExtraContainers:      slices.Clone(spec.ExtraContainers),
 	}
 
 	// Precedence: agent-level serviceAccountName > global default > auto-created SA (agent name)
@@ -197,8 +228,8 @@ func checkPullSecretAlreadyPresent(spec v1alpha2.DeclarativeDeploymentSpec) bool
 	return alreadyPresent
 }
 
-func resolveByoDeployment(agent *v1alpha2.Agent) (*resolvedDeployment, error) {
-	spec := agent.Spec.BYO.Deployment
+func resolveByoDeployment(agent v1alpha2.AgentObject) (*resolvedDeployment, error) {
+	spec := agent.GetAgentSpec().BYO.Deployment
 	if spec == nil {
 		return nil, fmt.Errorf("BYO deployment spec is required")
 	}
@@ -232,6 +263,10 @@ func resolveByoDeployment(agent *v1alpha2.Agent) (*resolvedDeployment, error) {
 		replicas = new(int32(1))
 	}
 
+	if err := validateExtraContainers(spec.ExtraContainers); err != nil {
+		return nil, err
+	}
+
 	dep := &resolvedDeployment{
 		Image:                image,
 		Cmd:                  cmd,
@@ -242,7 +277,7 @@ func resolveByoDeployment(agent *v1alpha2.Agent) (*resolvedDeployment, error) {
 		ImagePullSecrets:     slices.Clone(spec.ImagePullSecrets),
 		Volumes:              slices.Clone(spec.Volumes),
 		VolumeMounts:         slices.Clone(spec.VolumeMounts),
-		Labels:               getDefaultLabels(agent.Name, spec.Labels),
+		Labels:               getDefaultLabels(agent.GetName(), spec.Labels),
 		Annotations:          maps.Clone(spec.Annotations),
 		Env:                  slices.Clone(spec.Env),
 		Resources:            getDefaultResources(spec.Resources), // Set default resources if not specified
@@ -253,14 +288,17 @@ func resolveByoDeployment(agent *v1alpha2.Agent) (*resolvedDeployment, error) {
 		PodSecurityContext:   spec.PodSecurityContext,
 		ServiceAccountName:   spec.ServiceAccountName,
 		ServiceAccountConfig: spec.ServiceAccountConfig,
+		ExtraContainers:      slices.Clone(spec.ExtraContainers),
 	}
 
 	// Precedence: agent-level serviceAccountName > global default > auto-created SA (agent name)
 	if dep.ServiceAccountName == nil {
 		if DefaultServiceAccountName != "" {
-			dep.ServiceAccountName = new(DefaultServiceAccountName)
+			dep.ServiceAccountName = new(string)
+			*dep.ServiceAccountName = DefaultServiceAccountName
 		} else {
-			dep.ServiceAccountName = new(agent.Name)
+			dep.ServiceAccountName = new(string)
+			*dep.ServiceAccountName = agent.GetName()
 		}
 	}
 

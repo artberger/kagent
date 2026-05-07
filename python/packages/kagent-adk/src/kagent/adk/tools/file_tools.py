@@ -12,7 +12,6 @@ from typing import Any, Dict
 
 from google.adk.tools import BaseTool, ToolContext
 from google.genai import types
-
 from kagent.skills import (
     edit_file_content,
     get_edit_file_description,
@@ -29,11 +28,14 @@ logger = logging.getLogger("kagent_adk." + __name__)
 class ReadFileTool(BaseTool):
     """Read files with line numbers for precise editing."""
 
-    def __init__(self):
+    def __init__(self, skills_directory: str | Path):
         super().__init__(
             name="read_file",
             description=get_read_file_description(),
         )
+        self.skills_directory = Path(skills_directory).resolve()
+        if not self.skills_directory.exists():
+            raise ValueError(f"Skills directory does not exist: {self.skills_directory}")
 
     def _get_declaration(self) -> types.FunctionDeclaration:
         return types.FunctionDeclaration(
@@ -75,8 +77,8 @@ class ReadFileTool(BaseTool):
                 path = working_dir / path
             path = path.resolve()
 
-            return read_file_content(path, offset, limit)
-        except (FileNotFoundError, IsADirectoryError, IOError) as e:
+            return read_file_content(path, offset, limit, allowed_root=[working_dir, Path(self.skills_directory)])
+        except (FileNotFoundError, IsADirectoryError, PermissionError, IOError) as e:
             return f"Error reading file {file_path_str}: {e}"
 
 
@@ -124,8 +126,8 @@ class WriteFileTool(BaseTool):
                 path = working_dir / path
             path = path.resolve()
 
-            return write_file_content(path, content)
-        except IOError as e:
+            return write_file_content(path, content, allowed_root=working_dir)
+        except (PermissionError, IOError) as e:
             error_msg = f"Error writing file {file_path_str}: {e}"
             logger.error(error_msg)
             return error_msg
@@ -185,8 +187,8 @@ class EditFileTool(BaseTool):
                 path = working_dir / path
             path = path.resolve()
 
-            return edit_file_content(path, old_string, new_string, replace_all)
-        except (FileNotFoundError, IsADirectoryError, ValueError, IOError) as e:
+            return edit_file_content(path, old_string, new_string, replace_all, allowed_root=working_dir)
+        except (FileNotFoundError, IsADirectoryError, ValueError, PermissionError, IOError) as e:
             error_msg = f"Error editing file {file_path_str}: {e}"
             logger.error(error_msg)
             return error_msg

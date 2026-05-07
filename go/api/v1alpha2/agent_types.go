@@ -69,6 +69,12 @@ type AgentSpec struct {
 	// +optional
 	Skills *SkillForAgent `json:"skills,omitempty"`
 
+	// Sandbox configures sandboxed execution behavior shared across runtimes.
+	// This is intended for sandboxed declarative execution today, and can also
+	// be consumed by BYO agents.
+	// +optional
+	Sandbox *SandboxConfig `json:"sandbox,omitempty"`
+
 	// AllowedNamespaces defines which namespaces are allowed to reference this Agent as a tool.
 	// This follows the Gateway API pattern for cross-namespace route attachments.
 	// If not specified, only Agents in the same namespace can reference this Agent as a tool.
@@ -103,6 +109,21 @@ type SkillForAgent struct {
 	// +kubebuilder:validation:MinItems=1
 	// +optional
 	GitRefs []GitRepo `json:"gitRefs,omitempty"`
+
+	// Configuration for the skills-init init container.
+	// +optional
+	InitContainer *SkillsInitContainer `json:"initContainer,omitempty"`
+}
+
+// SkillsInitContainer configures the skills-init init container.
+type SkillsInitContainer struct {
+	// Resource requirements for the skills-init init container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Additional environment variables for the skills-init init container.
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 }
 
 // GitRepo specifies a single Git repository to fetch skills from.
@@ -120,7 +141,9 @@ type GitRepo struct {
 	// +optional
 	Path string `json:"path,omitempty"`
 
-	// Name for the skill directory under /skills. Defaults to the repo name.
+	// Name for the skill directory under /skills. If omitted, defaults to the last
+	// segment of Path when Path is set; otherwise defaults to the repo name (last
+	// URL path segment, without .git).
 	// +optional
 	Name string `json:"name,omitempty"`
 }
@@ -188,6 +211,22 @@ type DeclarativeAgentSpec struct {
 	// This includes event compaction (compression) and context caching.
 	// +optional
 	Context *ContextConfig `json:"context,omitempty"`
+}
+
+// SandboxConfig configures sandboxed execution behavior.
+type SandboxConfig struct {
+	// Network configures outbound network access for sandboxed execution paths.
+	// When unset or when allowedDomains is empty, outbound access is denied by default.
+	// +optional
+	Network *NetworkConfig `json:"network,omitempty"`
+}
+
+// NetworkConfig configures outbound network access for sandboxed execution paths.
+type NetworkConfig struct {
+	// AllowedDomains lists the domains that sandboxed execution may contact.
+	// Wildcards such as *.example.com are supported by the sandbox runtime.
+	// +optional
+	AllowedDomains []string `json:"allowedDomains,omitempty"`
 }
 
 // ContextConfig configures context management for an agent.
@@ -340,6 +379,10 @@ type SharedDeploymentSpec struct {
 	// is created, and this config will be applied to it.
 	// +optional
 	ServiceAccountConfig *ServiceAccountConfig `json:"serviceAccountConfig,omitempty"`
+	// ExtraContainers is a list of additional containers to run alongside the main agent container.
+	// Useful for sidecars such as token proxies, log shippers, or security agents.
+	// +optional
+	ExtraContainers []corev1.Container `json:"extraContainers,omitempty"`
 }
 
 type ServiceAccountConfig struct {
